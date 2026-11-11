@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -343,6 +343,8 @@ validate_preferences() {
     [[ "$HOSTNAME_DEB" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || die "hostname inválido: $HOSTNAME_DEB"
     [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "usuario inválido: $USERNAME"
     in_set "$USER_SHELL" /bin/bash /bin/zsh /bin/dash || die "shell inválida: $USER_SHELL"
+    [[ "$PASS_MIN_LEN" =~ ^[0-9]+$ ]] || die "longitud mínima no numérica: $PASS_MIN_LEN"
+    (( PASS_MIN_LEN >= 1 && PASS_MIN_LEN <= 4096 )) || die "longitud mínima fuera de rango: $PASS_MIN_LEN"
     in_set "$LOCALE" en_US.UTF-8 C.UTF-8 es_AR.UTF-8 || die "locale inválido: $LOCALE"
     in_set "$TZ_AREA" America/Argentina/Buenos_Aires UTC Etc/UTC || die "zona inválida: $TZ_AREA"
     in_set "$KEYMAP" latam es us || die "teclado inválido: $KEYMAP"
@@ -520,21 +522,49 @@ y video. No se crea ningun otro usuario interactivo.
 Shell: bash es el mas compatible; zsh anade un paquete; dash es minimo
 y poco comodo como shell interactiva.
 
+Longitud minima de contrasenas (pregunta propia):
+  Por defecto 1 = SIN minimo. Podes poner cualquier numero de 1 a 4096
+  si queres imponer uno vos mismo. YA NO hay un "12 obligatorio".
+  Con 1 se acepta desde un solo caracter hasta una frase larga.
+  Si elegis menos de 12 caracteres el script AVISA en pantalla, pero
+  NO te bloquea: la decision es tuya.
+
 Contrasenas (usuario, root y frase LUKS):
   - Se piden DOS veces y no se muestran.
-  - Se exigen 12+ caracteres ASCII imprimibles, sin acentos, sin espacios,
-    sin ':' y sin saltos de linea.
-  - Motivo: la frase LUKS la escribe el initramfs ANTES de cargar el
-    teclado completo. Si usas acentos, eñes o simbolos que cambian entre
-    el mapa latam y us, podras escribirla en el live pero NO al arrancar,
-    y el sistema parecera "no aceptar la contrasena". Es la causa mas
-    comun de bloqueo en instalaciones cifradas.
+  - Se aceptan TODOS los caracteres ASCII imprimibles (0x21 a 0x7E):
+    letras, numeros y signos como ! @ # $ % ^ & * ( ) - _ = + [ ] { }
+    ; ' , . < > / ? ~ " \ ` | e incluso ':' .
+  - NO se aceptan: espacios, tabuladores, saltos de linea, controles,
+    acentos, eñes, emojis ni cualquier byte UTF-8 no ASCII.
+  - '?' y '??' SON contrasenas validas. Para releer esta ayuda en el
+    prompt de contrasena pulsa ENTER SIN ESCRIBIR NADA (no uses '?',
+    porque ahora '?' puede ser tu contrasena). En las preguntas
+    normales si se usa '?'.
+  - Motivo de excluir acentos: la frase LUKS la pide el initramfs ANTES
+    de cargar el teclado completo. Si usas acentos, eñes o simbolos que
+    cambian entre el mapa latam y us, podras escribirla en el live pero
+    NO al arrancar, y el sistema parecera "no aceptar la contrasena".
+    Es la causa mas comun de bloqueo en instalaciones cifradas.
+  - Para que una contrasena corta NO sea rechazada despues por PAM,
+    el script usa `chpasswd -c YESCRYPT`: cifra directamente con libc
+    en lugar de pasar por pam_unix "obscure" / pam_pwquality.
+  - Para lo mismo en LUKS se usa `--force-password`, que desactiva el
+    control de calidad de contrasena de cryptsetup si el build lo trae.
+  - La frase se escribe en un archivo temporal SIN salto de linea final;
+    `--key-file -` lee stdin y NO corta en saltos de linea, por eso lo
+    que escribis es exactamente la frase, sin un \n escondido.
   - La frase LUKS NO se guarda en el state ni en el log. Si reinicias,
     tendras que volver a escribirla para --resume o --refresh-limine.
 
+AVISO DE SEGURIDAD (sin bloqueo): una contrasena corta es mucho mas
+vulnerable a fuerza bruta, sobre todo la frase LUKS. Si podes, usala
+larga; si no, el script igual te deja.
+
 Recomendado: frase LUKS larga pero ASCII (p. ej. 4 palabras sin tildes
 separadas por guiones), distinta de la contrasena del usuario.
+Fuente: https://manpages.debian.org/trixie/passwd/chpasswd.8.en.html
 Fuente: https://manpages.debian.org/trixie/cryptsetup-bin/cryptsetup-luksFormat.8.en.html
+Fuente: https://www.debian.org/doc/manuals/securing-debian-manual/ch04s11.en.html
 EOF
 }
 
@@ -723,7 +753,9 @@ problemas reales con argon2id.
 El script usa --type luks2, --label, --key-file - (la frase se pasa por
 stdin desde un archivo temporal en scratch/ con umask 077) y hace un
 luksHeaderBackup en RAM. crypttab luego usa UUID, no /dev/sda3, para que
-el orden de discos no rompa el arranque.
+el orden de discos no rompa el arranque. Se anade --force-password para
+que el control de calidad de contrasena (pwquality/passwdqc, si el build
+de cryptsetup lo trae) NO rechace una frase corta elegida por el usuario.
 
 Recomendado: argon2id con 65536 KiB.
 Fuente: https://manpages.debian.org/trixie/cryptsetup-bin/cryptsetup-luksFormat.8.en.html
@@ -1212,10 +1244,23 @@ menu() {
 }
 
 check_secret() {
-    local s="$1"
-    [[ "$s" != *:* ]] || die "La contraseña no puede contener ':' por chpasswd"
-    if ! printf '%s' "$s" | LC_ALL=C grep -qE -- '^[[:print:]]{12,}$'; then
-        die "Usa al menos 12 caracteres ASCII imprimibles, sin espacios ni acentos"
+    local s="$1" min="${PASS_MIN_LEN:-1}" len
+    [[ -n "$s" ]] || die "La contraseña no puede estar vacía"
+    # Rango ASCII imprimible 0x21..0x7E: excluye espacio, tabuladores,
+    # controles, acentos y cualquier byte UTF-8. -z trata la entrada como
+    # un unico registro, para que un salto de linea incrustado no cuele.
+    # ':' se permite porque
+    # chpasswd -c YESCRYPT toma como contraseña todo lo que sigue al
+    # primer ':' (verificado con el hash resultante).
+    if ! printf '%s' "$s" | LC_ALL=C grep -qzE -- '^[!-~]+$'; then
+        die "Usa solo caracteres ASCII imprimibles: sin espacios, sin acentos y sin controles"
+    fi
+    len=${#s}
+    if (( len < min )); then
+        die "La contraseña tiene $len caracteres, pero el mínimo configurado es $min (cámbialo en la pregunta de longitud mínima)"
+    fi
+    if (( len < 12 )); then
+        printf 'ADVERTENCIA: contraseña de %d caracteres; es corta y vulnerable a fuerza bruta. No se bloquea, solo se avisa.\n' "$len" >&2
     fi
 }
 
@@ -1228,10 +1273,13 @@ ask_secret() {
     fi
     while true; do
         show_help
-        IFS= read -r -s -p "$prompt (? muestra ayuda primero): " a || die "Entrada cancelada"
+        IFS= read -r -s -p "$prompt (Enter vacío = releer ayuda): " a || die "Entrada cancelada"
         printf '\n'
-        if [[ "$a" == "?" ]]; then
+        # '?' puede ser una contraseña válida; usamos la entrada vacía
+        # (que de todos modos no sería una contraseña válida) como ayuda.
+        if [[ -z "$a" ]]; then
             HELP_SHOWN=""
+            printf 'Mostrando de nuevo la explicación.\n'
             continue
         fi
         IFS= read -r -s -p "Repite $prompt: " b || die "Entrada cancelada"
@@ -1310,6 +1358,7 @@ set_defaults() {
     HOSTNAME_DEB=mini
     USERNAME=user
     USER_SHELL=/bin/bash
+    PASS_MIN_LEN=1
     USER_PASS=""
     ROOT_PASS=""
     LUKS_PASS=""
@@ -1383,7 +1432,7 @@ set_defaults() {
 }
 
 CONFIG_KEYS=(
-    U B R M SUITE ARCH HOSTNAME_DEB USERNAME USER_SHELL LOCALE TZ_AREA KEYMAP
+    U B R M SUITE ARCH HOSTNAME_DEB USERNAME USER_SHELL PASS_MIN_LEN LOCALE TZ_AREA KEYMAP
     MIRROR SECURITY COMPONENTS ESP_SIZE BIOS_SIZE BOOT_LABEL ROOT_LABEL LUKS_LABEL
     PBKDF PBKDF_MEM ROOT_FS KERNEL_HARDENING PLYMOUTH_THEME PLYMOUTH_FALLBACK
     LIMINE_EDITOR VERIFY_GPG GREETER GUI WM COMPOSITOR BAR LAUNCHER TERMINAL
@@ -1425,6 +1474,7 @@ collect_preferences() {
     ask USERNAME "Usuario" "$USERNAME"
     validate_regex USERNAME "usuario" '^[a-z_][a-z0-9_-]{0,31}$'
     menu USER_SHELL "Shell del usuario" 1 "/bin/bash" "/bin/zsh" "/bin/dash"
+    ask_num PASS_MIN_LEN "Longitud mínima de contraseñas (1 = sin mínimo)" "$PASS_MIN_LEN" 1 4096
     ask_secret USER_PASS "Contraseña del usuario"
     ask_secret ROOT_PASS "Contraseña de root"
     ask_secret LUKS_PASS "Frase LUKS (ASCII, sin acentos)"
@@ -1577,6 +1627,10 @@ self_check() {
         '--log'
         'grep -qF -- "$c" "$0"'
         'validate_preferences'
+        'PASS_MIN_LEN'
+        'chpasswd -c YESCRYPT'
+        '--force-password'
+        '^[!-~]+$'
         'run_in_dir'
         'ARTIFACT_DIR'
         'SCRATCH_DIR'
@@ -1811,15 +1865,15 @@ stage_3_luks_mount() {
     if (( ! DRY_RUN && ! SIMULATE )); then luks_pass_file "$pf"; fi
     if [[ "$PBKDF" == argon2id ]]; then
         if (( DRY_RUN || SIMULATE )); then
-            run cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf argon2id --pbkdf-memory "$PBKDF_MEM" --pbkdf-parallel 1 --iter-time 2000 --key-file - "$R"
+            run cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf argon2id --pbkdf-memory "$PBKDF_MEM" --pbkdf-parallel 1 --iter-time 2000 --force-password --key-file - "$R"
         else
-            cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf argon2id --pbkdf-memory "$PBKDF_MEM" --pbkdf-parallel 1 --iter-time 2000 --key-file - "$R" < "$pf"
+            cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf argon2id --pbkdf-memory "$PBKDF_MEM" --pbkdf-parallel 1 --iter-time 2000 --force-password --key-file - "$R" < "$pf"
         fi
     else
         if (( DRY_RUN || SIMULATE )); then
-            run cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf pbkdf2 --iter-time 4000 --key-file - "$R"
+            run cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf pbkdf2 --iter-time 4000 --force-password --key-file - "$R"
         else
-            cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf pbkdf2 --iter-time 4000 --key-file - "$R" < "$pf"
+            cryptsetup luksFormat --type luks2 --label "$LUKS_LABEL" --pbkdf pbkdf2 --iter-time 4000 --force-password --key-file - "$R" < "$pf"
         fi
     fi
     if (( DRY_RUN || SIMULATE )); then
@@ -1958,7 +2012,7 @@ set_chpasswd() {
     umask 077
     printf '%s:%s\n' "$user" "$pass" > "$f"
     umask "$old"
-    chroot "$M" /usr/sbin/chpasswd < "$f"
+    chroot "$M" /usr/sbin/chpasswd -c YESCRYPT < "$f"
     rm -f -- "$f"
 }
 
@@ -2310,7 +2364,9 @@ Uso: install.sh [OPCIONES]
   --version               Muestra versión.
   -h, --help              Esta ayuda.
 
-En cualquier pregunta escribe ? para volver a leer su explicación.
+En las preguntas normales escribe ? para volver a leer su explicación.
+En las de CONTRASEÑA, pulsa ENTER sin escribir nada (? puede ser tu clave).
+La longitud mínima se pregunta y por defecto es 1 (sin mínimo).
 
 Orden recomendado dentro del live:
   1) Descarga este mismo archivo desde la URL "Raw" de tu repositorio
