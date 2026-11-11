@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -182,21 +182,28 @@ verify_sha() {
 }
 
 derive_paths() {
-    local d
-    d="$(dirname "$LOG_FILE")"
-    STATE_DIR="$d/../state"
-    ARTIFACT_DIR="$d"
-    SCRATCH_DIR="$d/../scratch"
+    STATE_DIR="$BASE_DIR/state"
+    ARTIFACT_DIR="$BASE_DIR/artifacts"
+    SCRATCH_DIR="$BASE_DIR/scratch"
     STATE_FILE="$STATE_DIR/stage"
     CONFIG_FILE="$STATE_DIR/config"
+    if (( ! LOG_GIVEN )); then
+        LOG_FILE="$ARTIFACT_DIR/install.log"
+    fi
 }
 
 init_dirs() {
+    local logdir
+    logdir="$(dirname "$LOG_FILE")"
+    mkdir -p -- "$logdir" || die "No se puede crear el directorio del log: $logdir"
+    if [[ "$logdir" != /tmp ]]; then
+        chmod 700 -- "$logdir" 2>/dev/null || true
+    fi
     if (( DRY_RUN || SIMULATE )); then
         SCRATCH_DIR_REAL="/tmp/debian-live-install-simulado"
         return 0
     fi
-    mkdir -p "$STATE_DIR" "$ARTIFACT_DIR"
+    mkdir -p -- "$STATE_DIR" "$ARTIFACT_DIR"
     chmod 700 "$STATE_DIR" "$ARTIFACT_DIR"
     SCRATCH_DIR_REAL="$(mktemp -d "$SCRATCH_DIR.XXXXXX")"
     chmod 700 "$SCRATCH_DIR_REAL"
@@ -222,8 +229,13 @@ load_config_from() {
     local file="$1" line k v decoded allowed kk
     [[ -r "$file" ]] || die "No se puede leer la configuración: $file"
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        [[ "$line" == *=* ]] || die "Línea de configuración sin '=': $line"
         k="${line%%=*}"
         v="${line#*=}"
+        [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "Clave de configuración malformada: $k"
         allowed=0
         for kk in "${CONFIG_KEYS[@]}"; do
             if [[ "$kk" == "$k" ]]; then
@@ -232,7 +244,18 @@ load_config_from() {
             fi
         done
         (( allowed )) || die "Clave de configuración no permitida: $k"
-        decoded="$(printf '%s' "$v" | base64 -d)"
+        if [[ -z "$v" ]]; then
+            # Estas claves son legítimamente vacías: sin paquetes extra, o
+            # UUID/ABI aún no descubiertos en etapas tempranas.
+            case "$k" in
+                EXTRA_PACKAGES_STR|K|LUKS_UUID|ROOT_UUID|BOOT_UUID) ;;
+                *) die "Valor vacío para $k" ;;
+            esac
+        fi
+        if ! decoded="$(printf '%s' "$v" | base64 -d 2>/dev/null)"; then
+            die "Valor base64 inválido para $k"
+        fi
+        [[ "$decoded" != *$'\n'* && "$decoded" != *$'\r'* ]] || die "Valor con salto de línea no permitido: $k"
         printf -v "$k" '%s' "$decoded"
     done < "$file"
     parse_extra_packages
@@ -268,13 +291,106 @@ read_state() {
 parse_extra_packages() {
     EXTRA_PACKAGES=()
     local p oldifs
+    local -a arr=()
     oldifs="$IFS"
     IFS=' '
-    for p in $EXTRA_PACKAGES_STR; do
+    # read -ra evita el expansión de comodines que tendría: for p in $VAR
+    read -r -a arr <<< "$EXTRA_PACKAGES_STR"
+    IFS="$oldifs"
+    for p in "${arr[@]}"; do
         [[ "$p" =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || die "Paquete adicional inválido: $p"
         EXTRA_PACKAGES+=("$p")
     done
-    IFS="$oldifs"
+}
+
+in_set() {
+    local needle="$1" x
+    shift
+    for x in "$@"; do
+        if [[ "$x" == "$needle" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_ip() {
+    local s="$1"
+    if [[ "$s" =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$ ]]; then
+        return 0
+    fi
+    if [[ "$s" == *:* && "$s" =~ ^[0-9A-Fa-f:]+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Revalida TODAS las preferencias, vengan de preguntas, --config o --resume.
+# Sin esto, un --config podía saltarse los regex interactivos.
+validate_preferences() {
+    local k v
+    log "=== Revalidación estricta de preferencias ==="
+    for k in "${CONFIG_KEYS[@]}"; do
+        v="${!k}"
+        [[ "$v" != *$'\n'* && "$v" != *$'\r'* && "$v" != *$'\t'* ]] || die "Valor con carácter de control no permitido: $k"
+    done
+    [[ "$U" == /dev/sda ]] || die "El destino debe ser /dev/sda"
+    [[ "$B" == "${U}2" && "$R" == "${U}3" ]] || die "Particiones derivadas incorrectas: $B / $R"
+    [[ "$M" = /* && "$M" != "/" ]] || die "Punto de montaje inválido: $M"
+    [[ "$SUITE" == trixie && "$ARCH" == amd64 ]] || die "Solo trixie/amd64"
+    [[ "$LOG_FILE" == /tmp/* ]] || die "--log debe estar bajo /tmp (RAM) para no dejar rastros"
+    [[ "$LOG_FILE" != *..* ]] || die "--log no puede contener '..'"
+    [[ "$HOSTNAME_DEB" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || die "hostname inválido: $HOSTNAME_DEB"
+    [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "usuario inválido: $USERNAME"
+    in_set "$USER_SHELL" /bin/bash /bin/zsh /bin/dash || die "shell inválida: $USER_SHELL"
+    in_set "$LOCALE" en_US.UTF-8 C.UTF-8 es_AR.UTF-8 || die "locale inválido: $LOCALE"
+    in_set "$TZ_AREA" America/Argentina/Buenos_Aires UTC Etc/UTC || die "zona inválida: $TZ_AREA"
+    in_set "$KEYMAP" latam es us || die "teclado inválido: $KEYMAP"
+    [[ "$MIRROR" == https://* && "$MIRROR" =~ ^[A-Za-z0-9._/:-]+$ ]] || die "mirror inválido: $MIRROR"
+    [[ "$SECURITY" == https://* && "$SECURITY" =~ ^[A-Za-z0-9._/:-]+$ ]] || die "security inválido: $SECURITY"
+    [[ "$COMPONENTS" =~ ^[a-z0-9,+-]+$ ]] || die "componentes inválidos: $COMPONENTS"
+    in_set "$ESP_SIZE" 512M 1G 2G || die "ESP inválida: $ESP_SIZE"
+    in_set "$BIOS_SIZE" 1M 2M 8M || die "BIOS Boot inválido: $BIOS_SIZE"
+    [[ ${#BOOT_LABEL} -le 11 && "$BOOT_LABEL" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "etiqueta FAT inválida: $BOOT_LABEL"
+    [[ ${#ROOT_LABEL} -le 16 && "$ROOT_LABEL" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "etiqueta raíz inválida: $ROOT_LABEL"
+    [[ ${#LUKS_LABEL} -le 32 && "$LUKS_LABEL" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "etiqueta LUKS inválida: $LUKS_LABEL"
+    in_set "$PBKDF" argon2id pbkdf2 || die "KDF inválido: $PBKDF"
+    in_set "$PBKDF_MEM" 65536 131072 262144 524288 || die "memoria PBKDF inválida: $PBKDF_MEM"
+    in_set "$ROOT_FS" ext4 btrfs || die "rootfs inválido: $ROOT_FS"
+    in_set "$KERNEL_HARDENING" conservador agresivo ninguno || die "endurecimiento inválido: $KERNEL_HARDENING"
+    in_set "$PLYMOUTH_THEME" spinfinity spinner text details ninguno || die "tema Plymouth inválido: $PLYMOUTH_THEME"
+    in_set "$GREETER" greetd ly consola || die "greeter inválido: $GREETER"
+    in_set "$WM" openbox ninguno || die "WM inválido: $WM"
+    in_set "$COMPOSITOR" picom ninguno || die "compositor inválido: $COMPOSITOR"
+    in_set "$BAR" tint2 ninguno || die "barra inválida: $BAR"
+    in_set "$LAUNCHER" rofi ninguno || die "lanzador inválido: $LAUNCHER"
+    in_set "$TERMINAL" xterm alacritty ambas || die "terminal inválida: $TERMINAL"
+    in_set "$FONT_PKG" fonts-jetbrains-mono fonts-dejavu-core xfonts-terminus || die "fuente inválida: $FONT_PKG"
+    in_set "$PIPEWIRE" minimal bluetooth ninguno || die "PipeWire inválido: $PIPEWIRE"
+    in_set "$NETWORK" NetworkManager dhcpcd ninguno || die "red inválida: $NETWORK"
+    in_set "$FIRMWARE" completo minimo ninguno || die "firmware inválido: $FIRMWARE"
+    in_set "$MICROCODE" ambos intel amd ninguno || die "microcódigo inválido: $MICROCODE"
+    in_set "$DATA_POLICY" conservar borrar "sin respaldos" || die "política de datos inválida: $DATA_POLICY"
+    in_set "$ZRAM_SIZE" 2048 4096 1024 || die "ZRAM inválido: $ZRAM_SIZE"
+    [[ "$BG" =~ ^[0-9A-Fa-f]{6}$ && "$FG" =~ ^[0-9A-Fa-f]{6}$ && "$ACCENT" =~ ^[0-9A-Fa-f]{6}$ ]] || die "color hexadecimal inválido"
+    is_ip "$DNS1" || die "DNS primario inválido: $DNS1 (usa IP literal)"
+    is_ip "$DNS2" || die "DNS secundario inválido: $DNS2 (usa IP literal)"
+    for k in UEFI BIOS_BOOT UEFI_IA32 SECURE_BOOT FIREWALL APPARMOR DOAS AUDITD SSH ZRAM GUI VERIFY_GPG LIMINE_EDITOR PLYMOUTH_FALLBACK CLEAN_TRACES MAKE_HOST_BACKUP; do
+        in_set "${!k}" si no || die "$k debe ser si/no: ${!k}"
+    done
+    [[ "$SECURE_BOOT" == no ]] || die "Secure Boot debe estar desactivado"
+    if [[ "$GUI" == no && "$GREETER" != consola ]]; then
+        die "Un greeter gráfico requiere X11; elige consola o activa GUI"
+    fi
+    if (( ! DRY_RUN && ! SIMULATE )); then
+        [[ -z "$K" || "$K" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ABI de kernel inválido: $K"
+        for k in LUKS_UUID ROOT_UUID BOOT_UUID; do
+            v="${!k}"
+            [[ -z "$v" || "$v" =~ ^[A-Fa-f0-9-]{8,}$ ]] || die "$k inválido: $v"
+        done
+    fi
+    parse_extra_packages
+    log "Revalidación estricta OK"
 }
 
 # ---------------------------- explicaciones ----------------------------
@@ -661,8 +777,9 @@ ninguno:
 
 Estos valores se escriben en cmdline de limine.conf, no en sysctl, para
 que apliquen desde el primer arranque. No son un "kernel endurecido":
-Debian NO tiene linux-hardened; se usa linux-image-amd64 oficial mas
-estas opciones. Es la alternativa mas cercana y honesta.
+Debian NO distribuye un kernel "hardened" como paquete; se usa
+linux-image-amd64 oficial mas estas opciones. Es la alternativa mas
+cercana y honesta.
 
 Recomendado: conservador. Si algo no arranca, usa la entrada de texto
 del menu de Limine y edita cmdline.
@@ -945,7 +1062,7 @@ Si tu red usa un resolutor local (router, Pi-hole, VPN), pon aqui su IP.
 Si elegiste NetworkManager, el tambien puede reescribir resolv.conf al
 conectarse; no es un error.
 
-Usa solo IP literales, no nombres de host: en el primer arranque aun no
+Ahora se valida que sea IPv4 o IPv6 literal. Usa solo IP literales, no nombres de host: en el primer arranque aun no
 hay garantia de resolver nombres antes de que la red este arriba.
 
 Recomendado: deja los valores por defecto salvo que tengas un DNS propio.
@@ -1097,7 +1214,7 @@ menu() {
 check_secret() {
     local s="$1"
     [[ "$s" != *:* ]] || die "La contraseña no puede contener ':' por chpasswd"
-    if ! printf '%s' "$s" | LC_ALL=C grep -qE '^[[:print:]]{12,}$'; then
+    if ! printf '%s' "$s" | LC_ALL=C grep -qE -- '^[[:print:]]{12,}$'; then
         die "Usa al menos 12 caracteres ASCII imprimibles, sin espacios ni acentos"
     fi
 }
@@ -1126,6 +1243,13 @@ ask_secret() {
         HELP_SHOWN=""
         return 0
     done
+}
+
+ask_ip() {
+    local var="$1" prompt="$2" default="$3" v=""
+    ask v "$prompt (IPv4 o IPv6 literal)" "$default"
+    is_ip "$v" || die "DNS inválido: $v (usa una IP literal)"
+    printf -v "$var" '%s' "$v"
 }
 
 ask_hex() {
@@ -1238,6 +1362,8 @@ set_defaults() {
     DNS1=1.1.1.1
     DNS2=8.8.8.8
     DATA_POLICY=conservar
+    INTRO_OK=no
+    ALLOW_TARGET_MOUNTS=0
     MAKE_HOST_BACKUP=si
     CLEAN_TRACES=si
     EXTRA_PACKAGES_STR=""
@@ -1270,7 +1396,9 @@ CONFIG_KEYS=(
 
 collect_preferences() {
     log "=== Recogiendo preferencias (escribe ? para releer la explicación) ==="
-    HELP_FN=help_intro;      HELP_SHOWN=""; ask_yes DUMMY_INTRO "¿Entiendes que /dev/sda se borrará y que todo temporal vive en RAM?" "si"
+    HELP_FN=help_intro;      HELP_SHOWN=""
+    ask_yes INTRO_OK "¿Entiendes que /dev/sda se borrará y que todo temporal vive en RAM?" "si"
+    [[ "$INTRO_OK" == si ]] || die "Cancelado: no se confirmó el entendimiento del borrado"
     HELP_FN=help_target;     HELP_SHOWN=""
     ask U "Dispositivo destino (debe ser /dev/sda)" "$U"
     [[ "$U" == /dev/sda ]] || die "Este instalador está fijado a /dev/sda; salida por seguridad"
@@ -1405,8 +1533,8 @@ collect_preferences() {
     [[ "$SECURE_BOOT" == "no" ]] || die "Secure Boot debe estar desactivado para esta USB portable"
 
     HELP_FN=help_dns;        HELP_SHOWN=""
-    ask DNS1 "DNS primario" "$DNS1"
-    ask DNS2 "DNS secundario" "$DNS2"
+    ask_ip DNS1 "DNS primario" "$DNS1"
+    ask_ip DNS2 "DNS secundario" "$DNS2"
 
     HELP_FN=help_extras;     HELP_SHOWN=""
     ask EXTRA_PACKAGES_STR "Paquetes adicionales separados por espacios (vacío = ninguno)" "$EXTRA_PACKAGES_STR"
@@ -1442,37 +1570,42 @@ self_check() {
         'ly --validate-config'
         'help_all'
         '--explain'
+        '--dry-run'
+        '--resume'
+        '--refresh-limine'
+        '--config'
+        '--log'
+        'grep -qF -- "$c" "$0"'
+        'validate_preferences'
         'run_in_dir'
         'ARTIFACT_DIR'
         'SCRATCH_DIR'
         'STATE_DIR'
     )
-    # shellcheck disable=SC2016
-    # Las cadenas con $MIRROR/$SUITE son literales buscados dentro del propio script.
     local c
     for c in "${checks[@]}"; do
-        grep -qF "$c" "$0" || die "Falta comprobación de diseño: $c"
+        grep -qF -- "$c" "$0" || die "Falta comprobación de diseño: $c"
     done
     local banned1="REEM""PLAZAR" banned2="/mnt/""backup" banned3="linux""-hardened"
     local banned4="usb""-host" banned5="ev""al" banned6="deb""usb"
     local banned7="media/""respaldo" banned8="WIN""DOWS" banned9="back""up.img"
     local banned10="Get""-Disk" banned11="fat:""ro:" banned12="%""U%"
-    grep -q "$banned1" "$0" && die "Quedan marcadores prohibidos"
-    grep -q "$banned2" "$0" && die "Queda ruta de respaldo anterior"
-    grep -q "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
-    grep -q "$banned4" "$0" && die "Dispositivo anfitrión prohibido"
-    grep -qE "(^|[[:space:]])$banned5([[:space:]]|$)" "$0" && die "Construcción dinámica prohibida"
-    grep -qi "$banned6" "$0" && die "Queda el nombre de proyecto anterior"
-    grep -q "$banned7" "$0" && die "Queda punto de montaje de respaldo anterior"
-    grep -q "$banned8" "$0" && die "Queda referencia al anfitrión"
-    grep -q "$banned9" "$0" && die "Queda imagen auxiliar anterior"
-    grep -q "$banned10" "$0" && die "Queda identificacion de disco del anfitrion"
-    grep -q "$banned11" "$0" && die "Queda carpeta compartida anterior"
-    grep -q "$banned12" "$0" && die "Queda variable del anfitrion"
-    grep -q 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
-    grep -q 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
-    grep -q 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
-    grep -q 'CLEAN_TRACES' "$0" || die "Falta limpieza de rastros"
+    grep -qF -- "$banned1" "$0" && die "Quedan marcadores prohibidos"
+    grep -qF -- "$banned2" "$0" && die "Queda ruta de respaldo anterior"
+    grep -qF -- "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
+    grep -qF -- "$banned4" "$0" && die "Dispositivo anfitrión prohibido"
+    grep -qE -- "(^|[[:space:]])$banned5([[:space:]]|$)" "$0" && die "Construcción dinámica prohibida"
+    grep -qiF -- "$banned6" "$0" && die "Queda el nombre de proyecto anterior"
+    grep -qF -- "$banned7" "$0" && die "Queda punto de montaje de respaldo anterior"
+    grep -qF -- "$banned8" "$0" && die "Queda referencia al anfitrión"
+    grep -qF -- "$banned9" "$0" && die "Queda imagen auxiliar anterior"
+    grep -qF -- "$banned10" "$0" && die "Queda identificacion de disco del anfitrion"
+    grep -qF -- "$banned11" "$0" && die "Queda carpeta compartida anterior"
+    grep -qF -- "$banned12" "$0" && die "Queda variable del anfitrion"
+    grep -q -- 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
+    grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
+    grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
+    grep -q -- 'CLEAN_TRACES' "$0" || die "Falta limpieza de rastros"
     log "Autocomprobación estática OK"
     return 0
 }
@@ -1530,9 +1663,9 @@ preflight() {
         return 0
     fi
     require_root
-    grep -q '^VERSION_CODENAME=trixie$' /etc/os-release || die "El live no es Debian 13 trixie"
+    grep -q -- '^VERSION_CODENAME=trixie$' /etc/os-release || die "El live no es Debian 13 trixie"
     curl -fsI "$MIRROR/dists/$SUITE/Release" >/dev/null || die "Mirror no accesible"
-    curl -fsSL "$MIRROR/dists/$SUITE/Release" | grep -q '^Codename: trixie' || die "El mirror no es trixie"
+    curl -fsSL "$MIRROR/dists/$SUITE/Release" | grep -q -- '^Codename: trixie' || die "El mirror no es trixie"
     curl -fsI "$SECURITY/dists/trixie-security/Release" >/dev/null || die "Security no accesible"
     curl -fsI "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz" >/dev/null || die "Release de Limine no accesible"
     if [[ "$GREETER" == ly ]]; then
@@ -1551,13 +1684,15 @@ preflight() {
 
     test -b "$U" || die "$U no es dispositivo de bloque"
     lsblk -d -o NAME,MODEL,SERIAL,SIZE,TRAN,HOTPLUG "$U"
-    udevadm info --query=property --name="$U" | grep -E '^(ID_BUS|ID_MODEL|ID_SERIAL|ID_PATH)='
+    udevadm info --query=property --name="$U" | grep -E -- '^(ID_BUS|ID_MODEL|ID_SERIAL|ID_PATH)='
     [[ "$(lsblk -dn -o HOTPLUG "$U")" == "1" ]] || die "$U no parece extraíble"
     [[ "$(lsblk -dn -o TRAN "$U")" == "usb" ]] || die "$U no parece USB"
     local size
     size="$(lsblk -dn -o SIZE -b "$U")"
     (( size >= 58000000000 && size <= 61000000000 )) || die "Tamaño inesperado: $size bytes"
-    if lsblk -rno MOUNTPOINTS "$U" | grep -qv '^$'; then
+    if (( ALLOW_TARGET_MOUNTS )); then
+        log "Montajes de $M y $M/boot permitidos por --resume avanzado"
+    elif lsblk -rno MOUNTPOINTS "$U" | grep -qv -- '^$'; then
         die "Hay particiones montadas en $U; desmóntalas antes"
     fi
     log "Preflight OK"
@@ -1703,6 +1838,12 @@ stage_3_luks_mount() {
     capture LUKS_UUID blkid -s UUID -o value "$R"
     capture ROOT_UUID blkid -s UUID -o value /dev/mapper/cryptroot
     capture BOOT_UUID blkid -s UUID -o value "$B"
+    if (( ! DRY_RUN && ! SIMULATE )); then
+        local uuid
+        for uuid in "$LUKS_UUID" "$ROOT_UUID" "$BOOT_UUID"; do
+            [[ "$uuid" =~ ^[A-Fa-f0-9-]{8,}$ ]] || die "UUID inesperado: $uuid"
+        done
+    fi
     if (( ! DRY_RUN && ! SIMULATE )) && [[ "$MAKE_HOST_BACKUP" == si ]]; then
         cryptsetup luksHeaderBackup "$R" --header-backup-file "$ARTIFACT_DIR/luks-header.img"
         chmod 600 "$ARTIFACT_DIR/luks-header.img"
@@ -1802,6 +1943,7 @@ stage_6_packages() {
     # shellcheck disable=SC2016
     capture K bash -c 'basename "$(find "$1/boot" -maxdepth 1 -name "vmlinuz-*" | sort | tail -n 1)" | sed "s/^vmlinuz-//"' sh "$M"
     [[ -n "$K" ]] || die "No se pudo determinar versión del kernel"
+    [[ "$K" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ABI de kernel inválido: $K"
     log "Kernel ABI: $K"
     mark_stage 6
 }
@@ -2086,9 +2228,11 @@ stage_15_cleanup_finish() {
 
 final_summary() {
     log "=== Resumen final ==="
-    log "Directorio de estado y respaldos (RAM): $BASE_DIR"
-    log "Log: $LOG_FILE"
-    if [[ "$DATA_POLICY" != borrar ]]; then
+    if [[ "$DATA_POLICY" == borrar ]]; then
+        log "Estado y respaldos eliminados segun tu eleccion; --resume ya no funciona."
+    else
+        log "Directorio de estado y respaldos (RAM): $BASE_DIR"
+        log "Log: $LOG_FILE"
         log "AVISO: todo lo anterior se PIERDE al apagar o reiniciar la VM."
         log "Si quieres conservar la cabecera LUKS, copiala AHORA con curl/scp a otro servidor."
         log "Archivo: $ARTIFACT_DIR/luks-header.img"
@@ -2110,6 +2254,7 @@ refresh_limine() {
     else
         log "No hay configuración previa en RAM; se usarán valores por defecto y solo se corregirán las rutas"
     fi
+    validate_preferences
     install_host_deps
     if (( DRY_RUN || SIMULATE )); then
         K="SIMULADO-K"
@@ -2134,6 +2279,7 @@ refresh_limine() {
     mount_track "$M/boot" "$B"
     # shellcheck disable=SC2016
     capture K bash -c 'basename "$(find "$1/boot" -maxdepth 1 -name "vmlinuz-*" | sort | tail -n 1)" | sed "s/^vmlinuz-//"' sh "$M"
+    [[ -n "$K" && "$K" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ABI de kernel inválido: $K"
     sed -i -E "s#(path: boot\(\):/)vmlinuz-[^ ]+#\1vmlinuz-$K#; s#(module_path: boot\(\):/)initrd.img-[^ ]+#\1initrd.img-$K#" "$M/boot/limine.conf"
     cp "$M/boot/limine.conf" "$ARTIFACT_DIR/limine.conf" 2>/dev/null || true
     sync
@@ -2167,7 +2313,8 @@ Uso: install.sh [OPCIONES]
 En cualquier pregunta escribe ? para volver a leer su explicación.
 
 Orden recomendado dentro del live:
-  1) curl -fLo /tmp/install.sh https://raw.githubusercontent.com/TU_USUARIO/TU_REPO/main/install.sh
+  1) Descarga este mismo archivo desde la URL "Raw" de tu repositorio
+     GitHub con curl o wget y guardalo como /tmp/install.sh
   2) bash /tmp/install.sh --explain | less
   3) bash /tmp/install.sh --validate
   4) bash /tmp/install.sh --dry-run --simulate --yes
@@ -2190,8 +2337,20 @@ parse_args() {
             --yes|--accept-defaults) ACCEPT_DEFAULTS=1 ;;
             --resume) RESUME=1 ;;
             --refresh-limine) REFRESH_LIMINE=1 ;;
-            --config) shift; INPUT_CONFIG="$1" ;;
-            --log) shift; LOG_FILE="$1"; LOG_GIVEN=1 ;;
+            --config)
+                [[ $# -ge 2 ]] || die "--config requiere un archivo"
+                shift
+                INPUT_CONFIG="$1"
+                [[ "$INPUT_CONFIG" != -* ]] || die "--config no puede empezar por '-'"
+                ;;
+            --log)
+                [[ $# -ge 2 ]] || die "--log requiere una ruta"
+                shift
+                LOG_FILE="$1"
+                LOG_GIVEN=1
+                [[ "$LOG_FILE" == /tmp/* ]] || die "--log debe ser una ruta absoluta bajo /tmp (RAM) para no dejar rastros"
+                [[ "$LOG_FILE" != *..* ]] || die "--log no puede contener '..'"
+                ;;
             --version) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
             -h|--help) usage; exit 0 ;;
             *) die "Opción desconocida: $1" ;;
@@ -2235,12 +2394,15 @@ main() {
         load_config_from "$CONFIG_FILE"
         [[ -n "$INPUT_CONFIG" ]] && load_config_from "$INPUT_CONFIG"
         log "Reanudando desde etapa $((LAST_STAGE+1))"
+        validate_preferences
+        (( LAST_STAGE >= 3 )) && ALLOW_TARGET_MOUNTS=1
         preflight
         ensure_resume_mounts
     else
         [[ -n "$INPUT_CONFIG" ]] && load_config_from "$INPUT_CONFIG"
         collect_preferences
         derive_paths
+        validate_preferences
         preflight
         mark_stage 0
     fi
