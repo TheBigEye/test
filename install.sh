@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.0.3"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -373,6 +373,15 @@ validate_preferences() {
     in_set "$FIRMWARE" completo minimo ninguno || die "firmware inválido: $FIRMWARE"
     in_set "$MICROCODE" ambos intel amd ninguno || die "microcódigo inválido: $MICROCODE"
     in_set "$DATA_POLICY" conservar borrar "sin respaldos" || die "política de datos inválida: $DATA_POLICY"
+    in_set "$HOTPLUG_POLICY" permitir0 exigir1 omitir || die "política HOTPLUG inválida: $HOTPLUG_POLICY"
+    [[ "$SIZE_MIN_GB" =~ ^[0-9]+$ && "$SIZE_MAX_GB" =~ ^[0-9]+$ ]] || die "rango de tamaño no numérico"
+    (( SIZE_MIN_GB >= 1 && SIZE_MAX_GB <= 2000 && SIZE_MIN_GB <= SIZE_MAX_GB )) || die "rango de tamaño inválido: $SIZE_MIN_GB-$SIZE_MAX_GB GB"
+    if ! [[ "$CURL_RETRIES" =~ ^[0-9]+$ ]] || (( CURL_RETRIES > 10 )); then
+        die "reintentos inválidos: $CURL_RETRIES"
+    fi
+    if ! [[ "$NETWORK_TIMEOUT" =~ ^[0-9]+$ ]] || (( NETWORK_TIMEOUT < 1 || NETWORK_TIMEOUT > 120 )); then
+        die "timeout inválido: $NETWORK_TIMEOUT"
+    fi
     in_set "$ZRAM_SIZE" 2048 4096 1024 || die "ZRAM inválido: $ZRAM_SIZE"
     [[ "$BG" =~ ^[0-9A-Fa-f]{6}$ && "$FG" =~ ^[0-9A-Fa-f]{6}$ && "$ACCENT" =~ ^[0-9A-Fa-f]{6}$ ]] || die "color hexadecimal inválido"
     is_ip "$DNS1" || die "DNS primario inválido: $DNS1 (usa IP literal)"
@@ -413,7 +422,7 @@ show_help() {
 help_all() {
     local f
     for f in \
-        help_intro help_target help_workdir help_identity help_locale \
+        help_intro help_target help_disk_checks help_workdir help_identity help_locale \
         help_mirror help_components help_firmware help_microcode \
         help_partitions help_luks help_rootfs help_hardening \
         help_plymouth help_limine help_greeter help_gui help_zram \
@@ -462,8 +471,9 @@ help_target() {
 
 El destino esta FIJADO a /dev/sda. No se acepta otro valor, porque la VM
 tiene un solo disco y cualquier sustitucion generica podria apuntar al
-lugar equivocado. Antes de tocar nada se verifican modelo, serie, tamano
-aproximado de 59 GB, HOTPLUG=1, TRAN=usb y que no haya particiones montadas.
+lugar equivocado. Antes de tocar nada se verifican modelo, serie, tamano,
+TRAN=usb, que no haya particiones montadas y una politica de HOTPLUG que
+se explica en el bloque siguiente.
 
 Punto de montaje temporal: /mnt/target. Es solo un directorio del live
 donde se monta la raiz cifrada mientras se construye el sistema. No
@@ -473,6 +483,55 @@ Si el preflight falla aqui, NO continues: significa que /dev/sda no es
 el USB que esperabas o que esta en uso.
 
 Recomendado: deja /dev/sda y /mnt/target tal cual.
+EOF
+}
+
+# shellcheck disable=SC2016
+help_disk_checks() {
+    cat <<'EOF'
+=== Guardas del disco: HOTPLUG, TRAN y tamano ===
+
+Estas tres comprobaciones existen para NO borrar por accidente el disco
+del anfitrion. Ahora se pueden ajustar porque una VM no se comporta como
+un pendrive fisico.
+
+HOTPLUG (lsblk -dn -o HOTPLUG):
+  En un USB real conectado en caliente suele valer 1. En QEMU, cuando el
+  disco se presenta con usb-storage antes de arrancar, es habitual ver 0.
+  En TU salida se ve: TRAN=usb  HOTPLUG=0  SIZE 57.7G. Exigir 1 a ciegas
+  bloqueaba la instalacion aunque el disco fuera el correcto.
+  Opciones:
+    permitir0 (RECOMENDADO): acepta 0 o 1; avisa si es 0. Pensado para VM.
+    exigir1  : solo acepta 1. Util si mas adelante conectas la USB a una
+               PC fisica y quieres la comprobacion clasica.
+    omitir   : no mira HOTPLUG. Menos seguro; solo si sabes por que.
+  Sea cual sea la opcion, se sigue exigiendo TRAN=usb, /dev/sda fijo,
+  modelo/serie/tamano visibles, sin particiones montadas y la
+  confirmacion literal "BORRAR /dev/sda". HOTPLUG nunca fue el unico
+  guardia anti-anfitrion.
+
+TRAN (lsblk -dn -o TRAN):
+  Debe ser "usb". Es la comprobacion mas fiable en este escenario: si
+  /dev/sda fuera un disco SATA/virtio/NVMe del anfitrion, TRAN no seria
+  usb y el script abortaria. No es configurable a proposito.
+
+TAMANO (lsblk -dn -o SIZE -b, en bytes):
+  Cuidado con las unidades: "57.7G" en lsblk son GiB (base 1024), que
+  equivalen a ~61 900 000 000 bytes (61.9 GB decimales). El guard anterior
+  aceptaba solo 58 000 000 000 - 61 000 000 000 bytes y por eso rechazaba
+  tu disco de 57.7G por apenas 900 MB de diferencia.
+  Ahora se pregunta un rango en GB decimales. Por defecto 50-70 GB, que
+  cubre tanto 57.7 GiB (~61.9 GB) como 59 120 MiB (~61.99 GB). Si usas
+  otra USB de distinta capacidad, ajusta los dos numeros.
+
+RED:
+  Reintentos y timeout de curl. Con 3 reintentos y 15 s de conexion, un
+  mirror que titubea no aborta a la primera. Sube el timeout si tu red
+  es lenta; bajalo si quieres fallar rapido.
+
+Fuente: https://manpages.debian.org/trixie/util-linux/lsblk.8.en.html
+Fuente: https://www.qemu.org/docs/master/system/devices/usb.html
+Fuente: https://manpages.debian.org/trixie/curl/curl.1.en.html
 EOF
 }
 
@@ -1039,7 +1098,8 @@ nftables (SI por defecto): reglas inet filter con policy drop en input
     regla. Es intencional: primero arranca, despues expones.
 AppArmor (SI): perfiles Mandatory Access Control. En Debian viene activo
     desde Buster; se habilita el servicio. Coste minimo.
-doas (NO): alternativa minima a sudo. Se instala ademas de sudo, con
+opendoas (NO): alternativa minima a sudo (el paquete "doas" es solo
+    transicional; el real es opendoas). Se instala ademas de sudo, con
     `permit persist :sudo`. No sustituye nada; es comodidad.
 auditd (NO): daemon de auditoria. Util en servidores, genera muchos logs
     y escribe constantemente: mala idea en un pendrive.
@@ -1246,13 +1306,16 @@ menu() {
 check_secret() {
     local s="$1" min="${PASS_MIN_LEN:-1}" len
     [[ -n "$s" ]] || die "La contraseña no puede estar vacía"
-    # Rango ASCII imprimible 0x21..0x7E: excluye espacio, tabuladores,
-    # controles, acentos y cualquier byte UTF-8. -z trata la entrada como
-    # un unico registro, para que un salto de linea incrustado no cuele.
-    # ':' se permite porque
-    # chpasswd -c YESCRYPT toma como contraseña todo lo que sigue al
-    # primer ':' (verificado con el hash resultante).
-    if ! printf '%s' "$s" | LC_ALL=C grep -qzE -- '^[!-~]+$'; then
+    # Rango ASCII imprimible 0x21..0x7E. Se usa "tr -d" en vez de
+    # "grep -q" porque tr CONSUME toda la entrada: no cierra la tubería
+    # antes de tiempo y no provoca curl(23)/SIGPIPE con pipefail.
+    # Se CUENTAN BYTES con wc -c en vez de capturar la cadena: $(...) quita
+    # los saltos de línea finales y dejaría colar una contraseña con \n.
+    # Si queda algún byte tras borrar !-~, es espacio, tabulador, salto de
+    # línea, control, acento o UTF-8 no ASCII.
+    # ':' se permite porque chpasswd -c YESCRYPT toma como contraseña todo
+    # lo que sigue al primer ':' (verificado con el hash resultante).
+    if (( "$(printf '%s' "$s" | LC_ALL=C tr -d '!-~' | wc -c)" > 0 )); then
         die "Usa solo caracteres ASCII imprimibles: sin espacios, sin acentos y sin controles"
     fi
     len=${#s}
@@ -1413,6 +1476,11 @@ set_defaults() {
     DATA_POLICY=conservar
     INTRO_OK=no
     ALLOW_TARGET_MOUNTS=0
+    HOTPLUG_POLICY=permitir0
+    SIZE_MIN_GB=50
+    SIZE_MAX_GB=70
+    CURL_RETRIES=3
+    NETWORK_TIMEOUT=15
     MAKE_HOST_BACKUP=si
     CLEAN_TRACES=si
     EXTRA_PACKAGES_STR=""
@@ -1438,7 +1506,8 @@ CONFIG_KEYS=(
     LIMINE_EDITOR VERIFY_GPG GREETER GUI WM COMPOSITOR BAR LAUNCHER TERMINAL
     FONT FONT_PKG BG FG ACCENT ZRAM ZRAM_SIZE PIPEWIRE NETWORK FIREWALL APPARMOR
     DOAS AUDITD SSH FIRMWARE MICROCODE UEFI BIOS_BOOT UEFI_IA32 SECURE_BOOT
-    DNS1 DNS2 DATA_POLICY MAKE_HOST_BACKUP CLEAN_TRACES
+    DNS1 DNS2 DATA_POLICY HOTPLUG_POLICY SIZE_MIN_GB SIZE_MAX_GB
+    CURL_RETRIES NETWORK_TIMEOUT MAKE_HOST_BACKUP CLEAN_TRACES
     EXTRA_PACKAGES_STR K LUKS_UUID ROOT_UUID BOOT_UUID
     LIMINE_VER LIMINE_KEY LIMINE_SHA LY_VER ZIG_VER ZIG_SHA LY_SHA
 )
@@ -1455,6 +1524,14 @@ collect_preferences() {
     R="${U}3"
     ask M "Punto de montaje temporal del sistema" "$M"
     [[ "$M" = /* && "$M" != "/" ]] || die "Punto de montaje inválido: $M"
+
+    HELP_FN=help_disk_checks; HELP_SHOWN=""
+    menu HOTPLUG_POLICY "Política de HOTPLUG para /dev/sda" 1 "permitir0" "exigir1" "omitir"
+    ask_num SIZE_MIN_GB "Tamaño mínimo del disco (GB decimales)" "$SIZE_MIN_GB" 1 2000
+    ask_num SIZE_MAX_GB "Tamaño máximo del disco (GB decimales)" "$SIZE_MAX_GB" 1 2000
+    (( SIZE_MIN_GB <= SIZE_MAX_GB )) || die "El mínimo no puede superar el máximo"
+    ask_num CURL_RETRIES "Reintentos de curl" "$CURL_RETRIES" 0 10
+    ask_num NETWORK_TIMEOUT "Timeout de conexión de curl (segundos)" "$NETWORK_TIMEOUT" 1 120
 
     HELP_FN=help_workdir;    HELP_SHOWN=""
     menu DATA_POLICY "¿Qué hago con estado y respaldos en RAM?" 1 "conservar" "borrar" "sin respaldos"
@@ -1607,7 +1684,7 @@ self_check() {
         'trap cleanup EXIT'
         "trap 'fail"
         'confirm_wipe'
-        'curl -fsI "$MIRROR/dists/$SUITE/Release"'
+        'download_file "$MIRROR/dists/$SUITE/Release"'
         'cryptsetup luksHeaderBackup'
         'sha256sum -c -'
         'gpg --verify'
@@ -1630,11 +1707,22 @@ self_check() {
         'PASS_MIN_LEN'
         'chpasswd -c YESCRYPT'
         '--force-password'
-        '^[!-~]+$'
+        "tr -d '!-~'"
         'run_in_dir'
         'ARTIFACT_DIR'
         'SCRATCH_DIR'
         'STATE_DIR'
+        'head_url'
+        'download_file'
+        'check_release_codename'
+        'check_disk_guards'
+        'HOTPLUG_POLICY'
+        'opendoas'
+        'udevadm info --query=property'
+        'mounts="$(lsblk -rno MOUNTPOINTS "$U")"'
+        '|| true'
+        '--retry "$CURL_RETRIES"'
+        'EFI/BOOT/limine.conf'
     )
     local c
     for c in "${checks[@]}"; do
@@ -1644,6 +1732,9 @@ self_check() {
     local banned4="usb""-host" banned5="ev""al" banned6="deb""usb"
     local banned7="media/""respaldo" banned8="WIN""DOWS" banned9="back""up.img"
     local banned10="Get""-Disk" banned11="fat:""ro:" banned12="%""U%"
+    local banned13="| grep"" -q" banned14="5800""000000" banned15="no parece ""extraíble"
+    local banned16="mount ""base64" banned17="feh ""xsetroot" banned18="PKGS+=(do""as)"
+    local banned19="curl -fs""I "
     grep -qF -- "$banned1" "$0" && die "Quedan marcadores prohibidos"
     grep -qF -- "$banned2" "$0" && die "Queda ruta de respaldo anterior"
     grep -qF -- "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
@@ -1656,6 +1747,13 @@ self_check() {
     grep -qF -- "$banned10" "$0" && die "Queda identificacion de disco del anfitrion"
     grep -qF -- "$banned11" "$0" && die "Queda carpeta compartida anterior"
     grep -qF -- "$banned12" "$0" && die "Queda variable del anfitrion"
+    grep -qF -- "$banned13" "$0" && die "Vuelve una tubería hacia grep silencioso (falso negativo por EPIPE)"
+    grep -qF -- "$banned14" "$0" && die "Vuelve el rango de tamano rigido 58-61 GB"
+    grep -qF -- "$banned15" "$0" && die "Vuelve el guard HOTPLUG=1 rigido"
+    grep -qF -- "$banned16" "$0" && die "base64 no es paquete APT"
+    grep -qF -- "$banned17" "$0" && die "xsetroot no es paquete APT"
+    grep -qF -- "$banned18" "$0" && die "doas es transicional; usar opendoas"
+    grep -qF -- "$banned19" "$0" && die "Vuelve una peticion HEAD sin seguir redirecciones"
     grep -q -- 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
     grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
     grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
@@ -1669,7 +1767,7 @@ install_host_deps() {
     local deps=(
         debootstrap debian-archive-keyring gdisk dosfstools cryptsetup-bin parted
         gnupg curl wget ca-certificates git build-essential pkg-config
-        xz-utils zstd coreutils util-linux mount base64
+        xz-utils zstd coreutils util-linux mount
     )
     [[ "$ROOT_FS" == btrfs ]] && deps+=(btrfs-progs)
     if [[ "$GREETER" == ly ]]; then
@@ -1708,6 +1806,74 @@ check_tmp_space() {
     fi
 }
 
+# ---------------------------- red y guardas de disco ----------------------------
+
+head_url() {
+    local url="$1" label="$2"
+    log "+ comprobar $label: $url"
+    if (( DRY_RUN || SIMULATE )); then
+        return 0
+    fi
+    curl -fsSIL --retry "$CURL_RETRIES" --retry-delay 2 \
+        --connect-timeout "$NETWORK_TIMEOUT" --max-time "$((NETWORK_TIMEOUT * 8))" \
+        -o /dev/null "$url" || die "$label no accesible: $url"
+}
+
+download_file() {
+    local url="$1" dest="$2" label="$3"
+    log "+ descargar $label: $url -> $dest"
+    if (( DRY_RUN || SIMULATE )); then
+        return 0
+    fi
+    curl -fsSL --retry "$CURL_RETRIES" --retry-delay 2 \
+        --connect-timeout "$NETWORK_TIMEOUT" --max-time "$((NETWORK_TIMEOUT * 30))" \
+        -o "$dest" "$url" || die "No se pudo descargar $label: $url"
+    [[ -s "$dest" ]] || die "$label descargado vacío: $url"
+}
+
+# NUNCA encadenar curl con un grep silencioso: ese grep cierra la tubería
+# en cuanto encuentra el patrón, curl recibe EPIPE (error 23) y pipefail
+# convierte eso en un falso negativo. Se descarga a fichero y se busca
+# dentro del fichero ya cerrado.
+check_release_codename() {
+    local file="$1" expected="$2" label="$3"
+    if (( DRY_RUN || SIMULATE )); then
+        log "+ (simulación) comprobar $label contiene 'Codename: $expected'"
+        return 0
+    fi
+    grep -qF -- "Codename: $expected" "$file" || die "$label no contiene 'Codename: $expected'"
+}
+
+# Guardas PURAS: reciben valores ya leídos, para poder probarlas sin disco.
+check_disk_guards() {
+    local hotplug="$1" tran="$2" size="$3" min max
+    log "Guardas de disco: HOTPLUG=$hotplug TRAN=$tran SIZE=$size bytes"
+    case "$HOTPLUG_POLICY" in
+        permitir0)
+            [[ "$hotplug" == "0" || "$hotplug" == "1" ]] || die "HOTPLUG=$hotplug no es 0 ni 1; revisa $U"
+            if [[ "$hotplug" == "0" ]]; then
+                log "AVISO: HOTPLUG=0 (normal en QEMU usb-storage); aceptado por HOTPLUG_POLICY=permitir0"
+            fi
+            ;;
+        exigir1)
+            [[ "$hotplug" == "1" ]] || die "HOTPLUG=$hotplug; se exigía 1. Usa HOTPLUG_POLICY=permitir0 si estás en QEMU"
+            ;;
+        omitir)
+            log "AVISO: comprobación de HOTPLUG omitida por elección del usuario"
+            ;;
+        *)
+            die "HOTPLUG_POLICY inválida: $HOTPLUG_POLICY"
+            ;;
+    esac
+    [[ "$tran" == "usb" ]] || die "TRAN=$tran no es 'usb'; $U no parece el USB de la VM"
+    min=$(( SIZE_MIN_GB * 1000000000 ))
+    max=$(( SIZE_MAX_GB * 1000000000 ))
+    if (( size < min || size > max )); then
+        die "Tamaño $size bytes fuera del rango ${SIZE_MIN_GB}-${SIZE_MAX_GB} GB decimales; ajusta SIZE_MIN_GB/SIZE_MAX_GB"
+    fi
+    log "Guardas de disco OK"
+}
+
 preflight() {
     log "=== Preflight ==="
     if (( SIMULATE || DRY_RUN )); then
@@ -1718,13 +1884,15 @@ preflight() {
     fi
     require_root
     grep -q -- '^VERSION_CODENAME=trixie$' /etc/os-release || die "El live no es Debian 13 trixie"
-    curl -fsI "$MIRROR/dists/$SUITE/Release" >/dev/null || die "Mirror no accesible"
-    curl -fsSL "$MIRROR/dists/$SUITE/Release" | grep -q -- '^Codename: trixie' || die "El mirror no es trixie"
-    curl -fsI "$SECURITY/dists/trixie-security/Release" >/dev/null || die "Security no accesible"
-    curl -fsI "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz" >/dev/null || die "Release de Limine no accesible"
+
+    download_file "$MIRROR/dists/$SUITE/Release" "$SCRATCH_DIR_REAL/debian-Release" "Release de $SUITE"
+    check_release_codename "$SCRATCH_DIR_REAL/debian-Release" trixie "Release de $SUITE"
+    download_file "$SECURITY/dists/trixie-security/Release" "$SCRATCH_DIR_REAL/security-Release" "Release de trixie-security"
+    check_release_codename "$SCRATCH_DIR_REAL/security-Release" trixie-security "Release de trixie-security"
+    head_url "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz" "Release de Limine"
     if [[ "$GREETER" == ly ]]; then
-        curl -fsI "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" >/dev/null || die "Zig no accesible"
-        curl -fsI "https://codeberg.org/fairyglade/ly/archive/v${LY_VER}.tar.gz" >/dev/null || die "Ly no accesible"
+        head_url "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" "Zig"
+        head_url "https://codeberg.org/fairyglade/ly/archive/v${LY_VER}.tar.gz" "Ly"
     fi
     install_host_deps
     check_tmp_space
@@ -1738,16 +1906,24 @@ preflight() {
 
     test -b "$U" || die "$U no es dispositivo de bloque"
     lsblk -d -o NAME,MODEL,SERIAL,SIZE,TRAN,HOTPLUG "$U"
-    udevadm info --query=property --name="$U" | grep -E -- '^(ID_BUS|ID_MODEL|ID_SERIAL|ID_PATH)='
-    [[ "$(lsblk -dn -o HOTPLUG "$U")" == "1" ]] || die "$U no parece extraíble"
-    [[ "$(lsblk -dn -o TRAN "$U")" == "usb" ]] || die "$U no parece USB"
-    local size
+    # Informativo: si udevadm no expone esas claves, grep devuelve 1 y con
+    # pipefail + ERR eso abortaría. "|| true" lo convierte en no bloqueante.
+    udevadm info --query=property --name="$U" | grep -E -- '^(ID_BUS|ID_MODEL|ID_SERIAL|ID_PATH)=' || true
+
+    local hotplug tran size mounts
+    hotplug="$(lsblk -dn -o HOTPLUG "$U")"
+    tran="$(lsblk -dn -o TRAN "$U")"
     size="$(lsblk -dn -o SIZE -b "$U")"
-    (( size >= 58000000000 && size <= 61000000000 )) || die "Tamaño inesperado: $size bytes"
+    check_disk_guards "$hotplug" "$tran" "$size"
     if (( ALLOW_TARGET_MOUNTS )); then
         log "Montajes de $M y $M/boot permitidos por --resume avanzado"
-    elif lsblk -rno MOUNTPOINTS "$U" | grep -qv -- '^$'; then
-        die "Hay particiones montadas en $U; desmóntalas antes"
+    else
+        # Sin tubería: un grep silencioso también cerraría el pipe y daría
+        # un falso "hay particiones montadas" por EPIPE de lsblk.
+        mounts="$(lsblk -rno MOUNTPOINTS "$U")"
+        if [[ -n "${mounts//[[:space:]]/}" ]]; then
+            die "Hay particiones montadas en $U; desmóntalas antes"
+        fi
     fi
     log "Preflight OK"
 }
@@ -1964,7 +2140,7 @@ build_packages() {
     esac
     [[ "$FIREWALL" == si ]] && PKGS+=(nftables)
     [[ "$APPARMOR" == si ]] && PKGS+=(apparmor)
-    [[ "$DOAS" == si ]] && PKGS+=(doas)
+    [[ "$DOAS" == si ]] && PKGS+=(opendoas)
     [[ "$AUDITD" == si ]] && PKGS+=(auditd)
     [[ "$SSH" == si ]] && PKGS+=(openssh-server)
     [[ "$GREETER" == greetd ]] && PKGS+=(greetd tuigreet)
@@ -1977,7 +2153,7 @@ build_packages() {
         [[ "$LAUNCHER" == rofi ]] && PKGS+=(rofi)
         case "$TERMINAL" in xterm|ambas) PKGS+=(xterm) ;; esac
         case "$TERMINAL" in alacritty|ambas) PKGS+=(alacritty) ;; esac
-        PKGS+=(feh xsetroot)
+        PKGS+=(feh)
     fi
     PKGS+=("${EXTRA_PACKAGES[@]}")
 }
@@ -2080,8 +2256,8 @@ stage_9_limine() {
     ensure_target_dirs
     local work="$SCRATCH_DIR_REAL/limine-upstream"
     run mkdir -p "$work"
-    run curl -fLo "$work/limine-binary.tar.xz" "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz"
-    run curl -fLo "$work/limine-binary.tar.xz.sig" "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz.sig"
+    run curl -fL --retry "$CURL_RETRIES" --retry-delay 2 --connect-timeout "$NETWORK_TIMEOUT" --max-time "$((NETWORK_TIMEOUT * 30))" -o "$work/limine-binary.tar.xz" "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz"
+    run curl -fL --retry "$CURL_RETRIES" --retry-delay 2 --connect-timeout "$NETWORK_TIMEOUT" --max-time "$((NETWORK_TIMEOUT * 30))" -o "$work/limine-binary.tar.xz.sig" "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VER}/limine-binary.tar.xz.sig"
     verify_sha "$LIMINE_SHA" "$work/limine-binary.tar.xz"
     if [[ "$VERIFY_GPG" == si ]]; then
         run mkdir -m 0700 -p "$work/gnupg"
@@ -2123,6 +2299,11 @@ stage_9_limine() {
     write_line "$M/boot/limine.conf" "    path: boot():/vmlinuz-$K"
     write_line "$M/boot/limine.conf" "    cmdline: root=/dev/mapper/cryptroot rootfstype=$ROOT_FS ro plymouth.enable=0 break=premount"
     write_line "$M/boot/limine.conf" "    module_path: boot():/initrd.img-$K"
+    # CONFIG.md: en UEFI el primer candidato es <EFI app path>/limine.conf,
+    # es decir /EFI/BOOT/limine.conf. Dejar solo /limine.conf funciona, pero
+    # puede ser sombreado por otro candidato en otra partición.
+    run mkdir -p "$M/boot/EFI/BOOT"
+    run cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
     run sync
     [[ "$BIOS_BOOT" == si ]] && run "$work/limine-binary/limine" bios-install "$U" 1
     mark_stage 9
@@ -2172,8 +2353,8 @@ stage_12_greeter() {
         ly)
             local src="$SCRATCH_DIR_REAL/ly-build" zig lysrc cache gcache
             run mkdir -p "$src"
-            run curl -fLo "$src/zig.tar.xz" "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz"
-            run curl -fLo "$src/ly.tar.gz" "https://codeberg.org/fairyglade/ly/archive/v${LY_VER}.tar.gz"
+            run curl -fL --retry "$CURL_RETRIES" --retry-delay 2 --connect-timeout "$NETWORK_TIMEOUT" --max-time "$((NETWORK_TIMEOUT * 60))" -o "$src/zig.tar.xz" "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz"
+            run curl -fL --retry "$CURL_RETRIES" --retry-delay 2 --connect-timeout "$NETWORK_TIMEOUT" --max-time "$((NETWORK_TIMEOUT * 30))" -o "$src/ly.tar.gz" "https://codeberg.org/fairyglade/ly/archive/v${LY_VER}.tar.gz"
             verify_sha "$ZIG_SHA" "$src/zig.tar.xz"
             verify_sha "$LY_SHA" "$src/ly.tar.gz"
             run tar -xJf "$src/zig.tar.xz" -C "$src"
@@ -2317,6 +2498,7 @@ refresh_limine() {
         run mount "$B" "$M/boot"
         run sed -i "s#vmlinuz-SIMULADO-K#vmlinuz-$K#g" "$M/boot/limine.conf"
         run sed -i "s#initrd.img-SIMULADO-K#initrd.img-$K#g" "$M/boot/limine.conf"
+        run cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
         run umount -R "$M"
         run cryptsetup close cryptroot
         log "limine.conf actualizado en simulación; este script no quedó en el sistema instalado"
@@ -2335,6 +2517,7 @@ refresh_limine() {
     capture K bash -c 'basename "$(find "$1/boot" -maxdepth 1 -name "vmlinuz-*" | sort | tail -n 1)" | sed "s/^vmlinuz-//"' sh "$M"
     [[ -n "$K" && "$K" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ABI de kernel inválido: $K"
     sed -i -E "s#(path: boot\(\):/)vmlinuz-[^ ]+#\1vmlinuz-$K#; s#(module_path: boot\(\):/)initrd.img-[^ ]+#\1initrd.img-$K#" "$M/boot/limine.conf"
+    cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
     cp "$M/boot/limine.conf" "$ARTIFACT_DIR/limine.conf" 2>/dev/null || true
     sync
     umount -R "$M"
