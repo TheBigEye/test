@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.5"
+SCRIPT_VERSION="2.0.6"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -703,9 +703,21 @@ NO se anade non-free: no hace falta para arrancar y evita bloat. Si mas
 adelante necesitas un driver propietario, puedes editar
 /etc/apt/sources.list.d/debian.sources en el sistema ya instalado.
 
+Formato interno vs formato del archivo:
+  En las preguntas, --config y `debootstrap --components` se escriben
+  SEPARADOS POR COMAS (main,contrib,non-free-firmware). Pero debian.sources
+  es deb822 y `Components:` exige ESPACIOS, no comas: con comas APT intenta
+  buscar un unico componente llamado "main,contrib,non-free-firmware" y
+  emite "Skipping acquire of configured file ... component misspelt".
+  El script convierte las comas a espacios al escribir el archivo y borra
+  el /etc/apt/sources.list de una linea que dejo debootstrap, para que no
+  haya fuentes duplicadas. Asi tambien entran trixie-updates y
+  trixie-security, que con el error quedaban sin indices de paquetes.
+
 Recomendado: deja que el perfil de firmware decida; no escribas a mano.
 Fuente: https://www.debian.org/releases/stable/release-notes/index.en.html
 Fuente: https://manpages.debian.org/trixie/apt/sources.list.5.en.html
+Fuente: https://manpages.debian.org/trixie/debootstrap/debootstrap.8.en.html
 EOF
 }
 
@@ -783,10 +795,26 @@ BIOS Boot: 2M basta para el stage de Limine en GPT. 8M es margen extra.
 Etiquetas: FAT32 admite maximo 11 caracteres; se validan. La etiqueta
 LUKS es informativa (udev), no afecta a crypttab, que usa UUID.
 
+Herramientas de chequeo que el script instala EN EL SISTEMA DESTINO:
+  e2fsprogs   -> fsck.ext4  (raiz ext4 y el hook fsck de initramfs-tools)
+  dosfstools  -> fsck.vfat  (ESP /boot en FAT32)
+  btrfs-progs -> fsck.btrfs (solo si eliges btrfs como raiz)
+  zstd        -> compresor del initramfs; sin el, initramfs-tools avisa
+                 "W: No zstd in /usr/bin:/sbin:/bin, using gzip".
+En trixie, initramfs-tools-core depende de
+`logsave | e2fsprogs (<< 1.45.3-1~)`; APT puede elegir logsave y NO
+instalar e2fsprogs. Entonces update-initramfs avisa:
+  W: /sbin/fsck.ext4 doesn't exist, can't install to initramfs
+Por eso el script pide e2fsprogs y dosfstools explicitamente: el initramfs
+puede comprobar/reparar la raiz y el sistema puede chequear /boot.
+
 Recomendado: ESP 1G, BIOS Boot 2M, etiquetas por defecto.
 Fuente: https://www.debian.org/releases/stable/release-notes/issues.en.html#ensure-boot-has-enough-free-space
 Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/FAQ.md
 Fuente: https://manpages.debian.org/trixie/dosfstools/mkfs.fat.8.en.html
+Fuente: https://sources.debian.org/src/initramfs-tools/0.148.4/hooks/fsck/
+Fuente: https://packages.debian.org/trixie/amd64/e2fsprogs/filelist
+Fuente: https://packages.debian.org/trixie/amd64/dosfstools/filelist
 EOF
 }
 
@@ -1816,6 +1844,10 @@ self_check() {
         'LIMINE_BIOS_FORCE'
         'dd if=/dev/zero of="$p" bs=4096 count=1 conv=notrunc status=none'
         'cmp -n 4096 -s - /dev/zero'
+        'components_deb822="${COMPONENTS//,/ }"'
+        'Components: $components_deb822'
+        'rm -f "$M/etc/apt/sources.list"'
+        'e2fsprogs dosfstools zstd'
         'BIOSP=/dev/sda1'
     )
     local c
@@ -1830,6 +1862,7 @@ self_check() {
     local banned16="mount ""base64" banned17="feh ""xsetroot" banned18="PKGS+=(do""as)"
     local banned19="curl -fs""I "
     local banned20="wipe""fs -a \"" banned21="for part in \"\$BIOSP\" \"\$B\" \"\$R\""
+    local banned22="Compo""nents: \$COMPONENTS"
     grep -qF -- "$banned1" "$0" && die "Quedan marcadores prohibidos"
     grep -qF -- "$banned2" "$0" && die "Queda ruta de respaldo anterior"
     grep -qF -- "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
@@ -1851,6 +1884,7 @@ self_check() {
     grep -qF -- "$banned19" "$0" && die "Vuelve una peticion HEAD sin seguir redirecciones"
     grep -qF -- "$banned20" "$0" && die "Vuelve wipefs sobre particiones (E/S sub-sector)"
     grep -qF -- "$banned21" "$0" && die "Vuelve la limpieza de ESP/LUKS en etapa 2"
+    grep -qF -- "$banned22" "$0" && die "Vuelve Components con comas en deb822"
     grep -q -- 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
     grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
     grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
@@ -2225,18 +2259,24 @@ stage_4_debootstrap() {
 stage_5_sources() {
     log "=== Etapa 5: sources deb822 ==="
     ensure_chroot_mounts
+    # debootstrap --components usa COMAS; deb822 Components: usa ESPACIOS.
+    local components_deb822="${COMPONENTS//,/ }"
     write_lines "$M/etc/apt/sources.list.d/debian.sources" \
         "Types: deb" \
         "URIs: $MIRROR" \
         "Suites: trixie trixie-updates" \
-        "Components: $COMPONENTS" \
+        "Components: $components_deb822" \
         "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
         "" \
         "Types: deb" \
         "URIs: $SECURITY" \
         "Suites: trixie-security" \
-        "Components: $COMPONENTS" \
+        "Components: $components_deb822" \
         "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
+    # debootstrap deja /etc/apt/sources.list con una linea equivalente a
+    # "deb ... trixie main contrib non-free-firmware". Si se conserva, APT
+    # veria trixie duplicado. El deb822 de arriba es el autoritativo.
+    run rm -f "$M/etc/apt/sources.list"
     run chroot "$M" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
     mark_stage 5
 }
@@ -2245,6 +2285,7 @@ build_packages() {
     PKGS=(
         apt debian-archive-keyring ca-certificates systemd-sysv locales tzdata
         keyboard-configuration console-setup sudo coreutils util-linux
+        e2fsprogs dosfstools zstd
         linux-image-amd64 initramfs-tools cryptsetup cryptsetup-initramfs
         systemd-zram-generator plymouth plymouth-themes plymouth-label
         curl wget gnupg xz-utils zstd less nano htop pciutils usbutils
