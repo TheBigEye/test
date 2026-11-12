@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.6"
+SCRIPT_VERSION="2.0.7"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -1125,6 +1125,15 @@ nftables (SI por defecto): reglas inet filter con policy drop en input
     habilitar el servicio. Ojo: NO abre ningun puerto entrante; si luego
     instalas SSH y quieres acceder desde otra PC, tendras que anadir una
     regla. Es intencional: primero arranca, despues expones.
+
+    Dos detalles que evitan el error "Could not resolve protocol name":
+    - Se instala `netbase` (12 kB), que aporta /etc/protocols. nft resuelve
+      nombres como `ipv6-icmp` leyendo ESE archivo DENTRO del chroot; sin el,
+      debootstrap --variant=minbase no lo trae y `nft -c -f` aborta.
+    - Se usa `meta l4proto icmp` / `meta l4proto ipv6-icmp` en vez de
+      `ip6 nexthdr`: en la familia inet, meta l4proto salta los extension
+      headers de IPv6 y no depende de que el Next Header sea el ICMPv6.
+      La wiki de nftables lo recomienda explicitamente.
 AppArmor (SI): perfiles Mandatory Access Control. En Debian viene activo
     desde Buster; se habilita el servicio. Coste minimo.
 opendoas (NO): alternativa minima a sudo (el paquete "doas" es solo
@@ -1138,6 +1147,9 @@ openssh-server (NO): servidor SSH. Si lo activas, recuerda que nftables
 
 Recomendado: nftables SI, AppArmor SI, doas/auditd/ssh NO.
 Fuente: https://wiki.nftables.org/wiki-nftables/index.php/Matching_packet_headers
+Fuente: https://packages.debian.org/trixie/netbase
+Fuente: https://packages.debian.org/trixie/all/netbase/filelist
+Fuente: https://manpages.debian.org/trixie/nftables/nft.8.en.html
 Fuente: https://wiki.debian.org/AppArmor/HowToUse
 Fuente: https://manpages.debian.org/trixie/opendoas/doas.conf.5.en.html
 EOF
@@ -1847,7 +1859,9 @@ self_check() {
         'components_deb822="${COMPONENTS//,/ }"'
         'Components: $components_deb822'
         'rm -f "$M/etc/apt/sources.list"'
-        'e2fsprogs dosfstools zstd'
+        'e2fsprogs dosfstools zstd netbase'
+        'meta l4proto icmp accept'
+        'meta l4proto ipv6-icmp accept'
         'BIOSP=/dev/sda1'
     )
     local c
@@ -1863,6 +1877,7 @@ self_check() {
     local banned19="curl -fs""I "
     local banned20="wipe""fs -a \"" banned21="for part in \"\$BIOSP\" \"\$B\" \"\$R\""
     local banned22="Compo""nents: \$COMPONENTS"
+    local banned23="ip6 nexthdr ipv6""-icmp"
     grep -qF -- "$banned1" "$0" && die "Quedan marcadores prohibidos"
     grep -qF -- "$banned2" "$0" && die "Queda ruta de respaldo anterior"
     grep -qF -- "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
@@ -1885,6 +1900,7 @@ self_check() {
     grep -qF -- "$banned20" "$0" && die "Vuelve wipefs sobre particiones (E/S sub-sector)"
     grep -qF -- "$banned21" "$0" && die "Vuelve la limpieza de ESP/LUKS en etapa 2"
     grep -qF -- "$banned22" "$0" && die "Vuelve Components con comas en deb822"
+    grep -qF -- "$banned23" "$0" && die "Vuelve ip6 nexthdr ipv6""-icmp sin netbase"
     grep -q -- 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
     grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
     grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
@@ -2285,7 +2301,7 @@ build_packages() {
     PKGS=(
         apt debian-archive-keyring ca-certificates systemd-sysv locales tzdata
         keyboard-configuration console-setup sudo coreutils util-linux
-        e2fsprogs dosfstools zstd
+        e2fsprogs dosfstools zstd netbase
         linux-image-amd64 initramfs-tools cryptsetup cryptsetup-initramfs
         systemd-zram-generator plymouth plymouth-themes plymouth-label
         curl wget gnupg xz-utils zstd less nano htop pciutils usbutils
@@ -2595,8 +2611,8 @@ stage_14_security_network() {
             'flush ruleset' '' 'table inet filter {' '    chain input {' \
             '        type filter hook input priority 0; policy drop;' \
             '        iif lo accept' '        ct state established,related accept' \
-            '        ct state invalid drop' '        ip protocol icmp accept' \
-            '        ip6 nexthdr ipv6-icmp accept' \
+            '        ct state invalid drop' '        meta l4proto icmp accept' \
+            '        meta l4proto ipv6-icmp accept' \
             '        udp sport 67 udp dport 68 accept' \
             '        udp sport 547 udp dport 546 accept' '    }' \
             '    chain forward {' '        type filter hook forward priority 0; policy drop;' '    }' \
