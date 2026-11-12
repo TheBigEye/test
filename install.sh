@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.3"
+SCRIPT_VERSION="2.0.4"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -335,7 +335,7 @@ validate_preferences() {
         [[ "$v" != *$'\n'* && "$v" != *$'\r'* && "$v" != *$'\t'* ]] || die "Valor con carácter de control no permitido: $k"
     done
     [[ "$U" == /dev/sda ]] || die "El destino debe ser /dev/sda"
-    [[ "$B" == "${U}2" && "$R" == "${U}3" ]] || die "Particiones derivadas incorrectas: $B / $R"
+    [[ "$BIOSP" == "${U}1" && "$B" == "${U}2" && "$R" == "${U}3" ]] || die "Particiones derivadas incorrectas: $BIOSP / $B / $R"
     [[ "$M" = /* && "$M" != "/" ]] || die "Punto de montaje inválido: $M"
     [[ "$SUITE" == trixie && "$ARCH" == amd64 ]] || die "Solo trixie/amd64"
     [[ "$LOG_FILE" == /tmp/* ]] || die "--log debe estar bajo /tmp (RAM) para no dejar rastros"
@@ -374,6 +374,7 @@ validate_preferences() {
     in_set "$MICROCODE" ambos intel amd ninguno || die "microcódigo inválido: $MICROCODE"
     in_set "$DATA_POLICY" conservar borrar "sin respaldos" || die "política de datos inválida: $DATA_POLICY"
     in_set "$HOTPLUG_POLICY" permitir0 exigir1 omitir || die "política HOTPLUG inválida: $HOTPLUG_POLICY"
+    in_set "$LIMINE_BIOS_FORCE" si no || die "LIMINE_BIOS_FORCE debe ser si/no: $LIMINE_BIOS_FORCE"
     [[ "$SIZE_MIN_GB" =~ ^[0-9]+$ && "$SIZE_MAX_GB" =~ ^[0-9]+$ ]] || die "rango de tamaño no numérico"
     (( SIZE_MIN_GB >= 1 && SIZE_MAX_GB <= 2000 && SIZE_MIN_GB <= SIZE_MAX_GB )) || die "rango de tamaño inválido: $SIZE_MIN_GB-$SIZE_MAX_GB GB"
     if ! [[ "$CURL_RETRIES" =~ ^[0-9]+$ ]] || (( CURL_RETRIES > 10 )); then
@@ -427,7 +428,7 @@ help_all() {
         help_partitions help_luks help_rootfs help_hardening \
         help_plymouth help_limine help_greeter help_gui help_zram \
         help_pipewire help_network help_security help_bootmodes \
-        help_dns help_extras help_cleanup help_confirm; do
+        help_bios_install help_dns help_extras help_cleanup help_confirm; do
         printf '\n'
         "$f"
     done
@@ -1141,6 +1142,70 @@ EOF
 }
 
 # shellcheck disable=SC2016
+help_bios_install() {
+    cat <<'EOF'
+=== Limine BIOS: particion ef02 y firmas residuales ===
+
+Sintoma que puede aparecer en la etapa 9:
+
+  Installing to GPT. Logical block size of 512 bytes.
+  error: The partition selected to install the BIOS boot code to contains
+         a recognised filesystem.
+         Pass `--force` to override these checks.
+  Install failed, undoing work...
+
+Por que pasa:
+  `sgdisk --zap-all` borra la TABLA de particiones (MBR/GPT), pero NO borra
+  los DATOS que habia dentro de las particiones anteriores. Al reutilizar
+  la USB, la nueva particion 1 (tipo ef02, BIOS Boot, empieza en LBA 2048
+  = 1 MiB) cae justo encima del viejo boot sector: ahi siguen las cadenas
+  "FAT32" / "FAT" o el magic 0xEF53 de ext2/3/4.
+
+  El codigo de Limine 12.9.6 (validate_or_force en limine.c) lee estos
+  offsets al INICIO de la particion elegida:
+    +3     -> "NTFS"  o "FAT32" (5 bytes)
+    +54    -> "FAT"   (3 bytes)
+    +82    -> "FAT"   (3 bytes)
+    +1080  -> 0xEF53  (magic de superbloque ext2/3/4)
+  Si encuentra alguno, se NIEGA a escribir el stage 2 y sugiere --force.
+  Es una proteccion correcta: evita destruir un filesystem real por error.
+
+Solucion que aplica este script (SIN --force):
+  1. `wipefs -a` sobre cada particion recien creada, para borrar las firmas
+     conocidas de filesystem/RAID/LVM.
+  2. Ceros en los primeros 4096 bytes de cada particion. 4096 cubre con
+     holgura los cuatro offsets que inspecciona Limine.
+  3. Verificacion con `cmp` contra /dev/zero: si no quedaron a cero, el
+     script ABORTA en vez de seguir con un disco a medio limpiar.
+  Esto se hace en la etapa 2 (las 3 particiones) y OTRA VEZ en la etapa 9
+  justo antes de bios-install, para que tambien funcione con --resume.
+
+Que hace --force:
+  Segun `limine bios-install --help`, "Force installation even if the safety
+  checks fail (DANGEROUS!)". En el codigo, ademas de saltarse el aviso,
+  SOBREESCRIBE las firmas con ceros y puede saltar otras comprobaciones
+  de tabla de particiones. Equivale a nuestra limpieza pero sin verificar
+  y sin el resto de guardas. Por eso NO se usa por defecto.
+
+Opcion LIMINE_BIOS_FORCE:
+  no (RECOMENDADO): limpiar y verificar; bios-install sin --force.
+  si              : limpiar, verificar y ANNADIR --force. Solo si aun asi
+                    falla (firmware raro, tabla GPT exotica) y sabes que
+                    /dev/sda es tu USB. Queda registrado en el log.
+
+La particion ef02 NO se formatea: esta destinada en exclusiva al stage 2
+de Limine. Escribir ceros ahi es seguro y no borra datos del sistema, que
+viven en /boot (FAT32, particion 2) y en LUKS (particion 3).
+
+Recomendado: LIMINE_BIOS_FORCE=no.
+
+Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/USAGE.md
+Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/CONFIG.md
+Fuente: https://manpages.debian.org/trixie/util-linux/wipefs.8.en.html
+EOF
+}
+
+# shellcheck disable=SC2016
 help_dns() {
     cat <<'EOF'
 === DNS del sistema instalado ===
@@ -1413,6 +1478,7 @@ confirm_wipe() {
 
 set_defaults() {
     U=/dev/sda
+    BIOSP=/dev/sda1
     B=/dev/sda2
     R=/dev/sda3
     M=/mnt/target
@@ -1477,6 +1543,7 @@ set_defaults() {
     INTRO_OK=no
     ALLOW_TARGET_MOUNTS=0
     HOTPLUG_POLICY=permitir0
+    LIMINE_BIOS_FORCE=no
     SIZE_MIN_GB=50
     SIZE_MAX_GB=70
     CURL_RETRIES=3
@@ -1500,13 +1567,13 @@ set_defaults() {
 }
 
 CONFIG_KEYS=(
-    U B R M SUITE ARCH HOSTNAME_DEB USERNAME USER_SHELL PASS_MIN_LEN LOCALE TZ_AREA KEYMAP
+    U BIOSP B R M SUITE ARCH HOSTNAME_DEB USERNAME USER_SHELL PASS_MIN_LEN LOCALE TZ_AREA KEYMAP
     MIRROR SECURITY COMPONENTS ESP_SIZE BIOS_SIZE BOOT_LABEL ROOT_LABEL LUKS_LABEL
     PBKDF PBKDF_MEM ROOT_FS KERNEL_HARDENING PLYMOUTH_THEME PLYMOUTH_FALLBACK
     LIMINE_EDITOR VERIFY_GPG GREETER GUI WM COMPOSITOR BAR LAUNCHER TERMINAL
     FONT FONT_PKG BG FG ACCENT ZRAM ZRAM_SIZE PIPEWIRE NETWORK FIREWALL APPARMOR
     DOAS AUDITD SSH FIRMWARE MICROCODE UEFI BIOS_BOOT UEFI_IA32 SECURE_BOOT
-    DNS1 DNS2 DATA_POLICY HOTPLUG_POLICY SIZE_MIN_GB SIZE_MAX_GB
+    DNS1 DNS2 DATA_POLICY HOTPLUG_POLICY LIMINE_BIOS_FORCE SIZE_MIN_GB SIZE_MAX_GB
     CURL_RETRIES NETWORK_TIMEOUT MAKE_HOST_BACKUP CLEAN_TRACES
     EXTRA_PACKAGES_STR K LUKS_UUID ROOT_UUID BOOT_UUID
     LIMINE_VER LIMINE_KEY LIMINE_SHA LY_VER ZIG_VER ZIG_SHA LY_SHA
@@ -1659,6 +1726,9 @@ collect_preferences() {
     menu SECURE_BOOT "Secure Boot activo en el firmware" 1 "no" "si"
     [[ "$SECURE_BOOT" == "no" ]] || die "Secure Boot debe estar desactivado para esta USB portable"
 
+    HELP_FN=help_bios_install; HELP_SHOWN=""
+    menu LIMINE_BIOS_FORCE "¿Añadir --force a limine bios-install?" 1 "no" "si"
+
     HELP_FN=help_dns;        HELP_SHOWN=""
     ask_ip DNS1 "DNS primario" "$DNS1"
     ask_ip DNS2 "DNS secundario" "$DNS2"
@@ -1723,6 +1793,11 @@ self_check() {
         '|| true'
         '--retry "$CURL_RETRIES"'
         'EFI/BOOT/limine.conf'
+        'clean_partition_start'
+        'LIMINE_BIOS_FORCE'
+        'wipefs -a "$p"'
+        'cmp -n 4096 -s - /dev/zero'
+        'BIOSP=/dev/sda1'
     )
     local c
     for c in "${checks[@]}"; do
@@ -1758,6 +1833,10 @@ self_check() {
     grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
     grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
     grep -q -- 'CLEAN_TRACES' "$0" || die "Falta limpieza de rastros"
+    # shellcheck disable=SC2016
+    # El literal con $BIOSP se busca tal cual dentro de este archivo.
+    grep -qF -- 'clean_partition_start "$BIOSP"' "$0" || die "Falta la limpieza de la BIOS Boot antes de bios-install"
+    grep -qF -- 'LIMINE_BIOS_FORCE=si; se anade --force' "$0" || die "Falta la rama --force condicional"
     log "Autocomprobación estática OK"
     return 0
 }
@@ -1767,7 +1846,7 @@ install_host_deps() {
     local deps=(
         debootstrap debian-archive-keyring gdisk dosfstools cryptsetup-bin parted
         gnupg curl wget ca-certificates git build-essential pkg-config
-        xz-utils zstd coreutils util-linux mount
+        xz-utils zstd coreutils diffutils util-linux mount
     )
     [[ "$ROOT_FS" == btrfs ]] && deps+=(btrfs-progs)
     if [[ "$GREETER" == ly ]]; then
@@ -1898,7 +1977,7 @@ preflight() {
     check_tmp_space
 
     local c
-    for c in bash lsblk blkid udevadm sgdisk partprobe mkfs.fat cryptsetup mkfs.ext4 debootstrap chroot curl wget sha256sum base64 tar make gpg git pkg-config apt-get mount umount findmnt systemctl df; do
+    for c in bash lsblk blkid udevadm sgdisk partprobe wipefs dd cmp mkfs.fat cryptsetup mkfs.ext4 debootstrap chroot curl wget sha256sum base64 tar make gpg git pkg-config apt-get mount umount findmnt systemctl df; do
         require_cmd "$c"
     done
     [[ "$ROOT_FS" == btrfs ]] && require_cmd mkfs.btrfs
@@ -2010,6 +2089,28 @@ stage_1_prepare() {
     mark_stage 1
 }
 
+# Limpia firmas de filesystem residuales al INICIO de una particion.
+# sgdisk --zap-all borra la tabla GPT pero NO los datos: al reutilizar la
+# USB, la nueva ef02 (LBA 2048) conserva el boot sector anterior y Limine
+# 12.9.6 se niega a instalar el stage 2 (validate_or_force en limine.c).
+# 4096 bytes cubren los offsets +3, +54, +82 y +1080 que inspecciona.
+clean_partition_start() {
+    local p="$1"
+    log "=== Limpiando firmas residuales al inicio de $p ==="
+    if (( ! DRY_RUN && ! SIMULATE )); then
+        test -b "$p" || die "No existe $p; no se pueden limpiar firmas"
+    fi
+    run wipefs -a "$p"
+    run dd if=/dev/zero of="$p" bs=4096 count=1 conv=notrunc status=none
+    if (( ! DRY_RUN && ! SIMULATE )); then
+        # cmp consume toda la entrada: no hay EPIPE ni falso negativo.
+        if ! dd if="$p" bs=4096 count=1 status=none | cmp -n 4096 -s - /dev/zero; then
+            die "Los primeros 4096 bytes de $p no quedaron a cero; abortando antes de instalar Limine"
+        fi
+    fi
+    log "Firmas eliminadas y verificadas en $p"
+}
+
 stage_2_partition() {
     log "=== Etapa 2: particionado DESTRUCTIVO ==="
     run sgdisk --zap-all "$U"
@@ -2018,6 +2119,12 @@ stage_2_partition() {
     run sgdisk -n 3:0:0 -t 3:8309 -c 3:LUKSROOT "$U"
     run partprobe "$U"
     run udevadm settle
+    # sgdisk --zap-all NO borra datos: limpiar el inicio de las 3 particiones
+    # recien creadas para que no queden firmas FAT/ext/LUKS de usos anteriores.
+    local part
+    for part in "$BIOSP" "$B" "$R"; do
+        clean_partition_start "$part"
+    done
     if (( ! DRY_RUN && ! SIMULATE )); then
         test -b "$B" || die "No existe $B"
         test -b "$R" || die "No existe $R"
@@ -2305,7 +2412,16 @@ stage_9_limine() {
     run mkdir -p "$M/boot/EFI/BOOT"
     run cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
     run sync
-    [[ "$BIOS_BOOT" == si ]] && run "$work/limine-binary/limine" bios-install "$U" 1
+    if [[ "$BIOS_BOOT" == si ]]; then
+        # Otra vez aqui: con --resume la etapa 2 no se repite.
+        clean_partition_start "$BIOSP"
+        if [[ "$LIMINE_BIOS_FORCE" == si ]]; then
+            log "ADVERTENCIA: LIMINE_BIOS_FORCE=si; se anade --force a bios-install"
+            run "$work/limine-binary/limine" bios-install "$U" 1 --force
+        else
+            run "$work/limine-binary/limine" bios-install "$U" 1
+        fi
+    fi
     mark_stage 9
 }
 
