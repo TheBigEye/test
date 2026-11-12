@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.4"
+SCRIPT_VERSION="2.0.5"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -1171,14 +1171,30 @@ Por que pasa:
   Es una proteccion correcta: evita destruir un filesystem real por error.
 
 Solucion que aplica este script (SIN --force):
-  1. `wipefs -a` sobre cada particion recien creada, para borrar las firmas
-     conocidas de filesystem/RAID/LVM.
-  2. Ceros en los primeros 4096 bytes de cada particion. 4096 cubre con
-     holgura los cuatro offsets que inspecciona Limine.
-  3. Verificacion con `cmp` contra /dev/zero: si no quedaron a cero, el
+  1. Ceros en los primeros 4096 bytes de la UNICA particion que Limine
+     BIOS inspecciona: /dev/sda1 (ef02). 4096 cubre con holgura los
+     cuatro offsets (+3, +54, +82, +1080).
+  2. Verificacion con `cmp` contra /dev/zero: si no quedaron a cero, el
      script ABORTA en vez de seguir con un disco a medio limpiar.
-  Esto se hace en la etapa 2 (las 3 particiones) y OTRA VEZ en la etapa 9
-  justo antes de bios-install, para que tambien funcione con --resume.
+
+  NO se ejecuta `wipefs` sobre /dev/sda2 ni /dev/sda3. La etapa 3 crea
+  un FAT32 nuevo con `mkfs.fat` y un LUKS2 nuevo con `luksFormat`, que
+  reescriben esas cabeceras. Ademas, `wipefs -a` hace escrituras de 5
+  bytes en offsets como +82; con QEMU `cache=none` sobre un disco fisico
+  del anfitrion eso puede terminar en "critical target error" /
+  "lost async page write". Una sola escritura alineada de 4096 bytes
+  evita ese patron sin perder la proteccion de Limine.
+
+  Esto se hace en la etapa 2 y OTRA VEZ en la etapa 9 justo antes de
+  bios-install, para que tambien funcione con --resume.
+
+Si en el live aparece "critical target error" o "lost async page write",
+NO es un fallo de Limine: es el anfitrion que rechazo la escritura.
+Antes de continuar revisa en el live:
+
+  lsblk -o NAME,RO,TRAN,HOTPLUG /dev/sda
+  blockdev --getro /dev/sda /dev/sda2
+  dmesg | tail -50
 
 Que hace --force:
   Segun `limine bios-install --help`, "Force installation even if the safety
@@ -1197,11 +1213,14 @@ La particion ef02 NO se formatea: esta destinada en exclusiva al stage 2
 de Limine. Escribir ceros ahi es seguro y no borra datos del sistema, que
 viven en /boot (FAT32, particion 2) y en LUKS (particion 3).
 
-Recomendado: LIMINE_BIOS_FORCE=no.
-
+Fuente: https://github.com/Limine-Bootloader/Limine/blob/v12.9.6/host/limine.c
 Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/USAGE.md
 Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/CONFIG.md
-Fuente: https://manpages.debian.org/trixie/util-linux/wipefs.8.en.html
+Fuente: https://www.qemu.org/docs/master/system/invocation.html
+Fuente: https://manpages.debian.org/trixie/dosfstools/mkfs.fat.8.en.html
+Fuente: https://manpages.debian.org/trixie/cryptsetup-bin/cryptsetup-luksFormat.8.en.html
+
+Recomendado: LIMINE_BIOS_FORCE=no.
 EOF
 }
 
@@ -1795,7 +1814,7 @@ self_check() {
         'EFI/BOOT/limine.conf'
         'clean_partition_start'
         'LIMINE_BIOS_FORCE'
-        'wipefs -a "$p"'
+        'dd if=/dev/zero of="$p" bs=4096 count=1 conv=notrunc status=none'
         'cmp -n 4096 -s - /dev/zero'
         'BIOSP=/dev/sda1'
     )
@@ -1810,6 +1829,7 @@ self_check() {
     local banned13="| grep"" -q" banned14="5800""000000" banned15="no parece ""extraíble"
     local banned16="mount ""base64" banned17="feh ""xsetroot" banned18="PKGS+=(do""as)"
     local banned19="curl -fs""I "
+    local banned20="wipe""fs -a \"" banned21="for part in \"\$BIOSP\" \"\$B\" \"\$R\""
     grep -qF -- "$banned1" "$0" && die "Quedan marcadores prohibidos"
     grep -qF -- "$banned2" "$0" && die "Queda ruta de respaldo anterior"
     grep -qF -- "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
@@ -1829,6 +1849,8 @@ self_check() {
     grep -qF -- "$banned17" "$0" && die "xsetroot no es paquete APT"
     grep -qF -- "$banned18" "$0" && die "doas es transicional; usar opendoas"
     grep -qF -- "$banned19" "$0" && die "Vuelve una peticion HEAD sin seguir redirecciones"
+    grep -qF -- "$banned20" "$0" && die "Vuelve wipefs sobre particiones (E/S sub-sector)"
+    grep -qF -- "$banned21" "$0" && die "Vuelve la limpieza de ESP/LUKS en etapa 2"
     grep -q -- 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
     grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
     grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
@@ -1977,7 +1999,7 @@ preflight() {
     check_tmp_space
 
     local c
-    for c in bash lsblk blkid udevadm sgdisk partprobe wipefs dd cmp mkfs.fat cryptsetup mkfs.ext4 debootstrap chroot curl wget sha256sum base64 tar make gpg git pkg-config apt-get mount umount findmnt systemctl df; do
+    for c in bash lsblk blkid udevadm sgdisk partprobe dd cmp mkfs.fat cryptsetup mkfs.ext4 debootstrap chroot curl wget sha256sum base64 tar make gpg git pkg-config apt-get mount umount findmnt systemctl df; do
         require_cmd "$c"
     done
     [[ "$ROOT_FS" == btrfs ]] && require_cmd mkfs.btrfs
@@ -2096,11 +2118,14 @@ stage_1_prepare() {
 # 4096 bytes cubren los offsets +3, +54, +82 y +1080 que inspecciona.
 clean_partition_start() {
     local p="$1"
-    log "=== Limpiando firmas residuales al inicio de $p ==="
+    log "=== Limpiando los primeros 4096 bytes de $p (firmas residuales) ==="
     if (( ! DRY_RUN && ! SIMULATE )); then
         test -b "$p" || die "No existe $p; no se pueden limpiar firmas"
     fi
-    run wipefs -a "$p"
+    # Escritura ALINEADA de 4096 bytes: cubre +3, +54, +82 y +1080 de
+    # validate_or_force() de Limine. No se usa wipefs aqui: sus escrituras
+    # sub-sector (5 bytes en +82) son innecesarias y, con QEMU cache=none
+    # sobre un dispositivo de bloque del anfitrion, pueden fallar con E/S.
     run dd if=/dev/zero of="$p" bs=4096 count=1 conv=notrunc status=none
     if (( ! DRY_RUN && ! SIMULATE )); then
         # cmp consume toda la entrada: no hay EPIPE ni falso negativo.
@@ -2108,7 +2133,7 @@ clean_partition_start() {
             die "Los primeros 4096 bytes de $p no quedaron a cero; abortando antes de instalar Limine"
         fi
     fi
-    log "Firmas eliminadas y verificadas en $p"
+    log "Primeros 4096 bytes a cero y verificados en $p"
 }
 
 stage_2_partition() {
@@ -2119,12 +2144,11 @@ stage_2_partition() {
     run sgdisk -n 3:0:0 -t 3:8309 -c 3:LUKSROOT "$U"
     run partprobe "$U"
     run udevadm settle
-    # sgdisk --zap-all NO borra datos: limpiar el inicio de las 3 particiones
-    # recien creadas para que no queden firmas FAT/ext/LUKS de usos anteriores.
-    local part
-    for part in "$BIOSP" "$B" "$R"; do
-        clean_partition_start "$part"
-    done
+    # sgdisk --zap-all NO borra datos: limpiar SOLO el inicio de la BIOS
+    # Boot (ef02), que es lo unico que inspecciona Limine. /boot y LUKS
+    # se reescriben en la etapa 3 con mkfs.fat y luksFormat, asi que no
+    # hace falta tocar $B ni $R aqui.
+    clean_partition_start "$BIOSP"
     if (( ! DRY_RUN && ! SIMULATE )); then
         test -b "$B" || die "No existe $B"
         test -b "$R" || die "No existe $R"
