@@ -38,7 +38,7 @@
 #   does not clear the screen when it exits) and then runs fbterm.
 #   Your original TTY (getty + login on /dev/ttyN) is untouched:
 #   FbTerm only replaces text rendering while it is active, and
-#   Ctrl+Alt+E returns you to the kernel console.
+#   Typing "exit" inside FbTerm returns you to the kernel console.
 #
 # Usage:
 #   ./install-fbterm-background.sh [--no-apt] [--allow-root]
@@ -62,7 +62,8 @@
 # used by fbterm's VESA mode.
 #
 # Emergency exits:
-#   - Inside FbTerm: Ctrl+Alt+E.
+#   - Inside FbTerm: type "exit". (FbTerm's Ctrl+Alt+E shortcut
+#     needs CAP_SYS_TTY_CONFIG; see "man fbterm", SECURITY NOTES.)
 #   - Disable without uninstalling:
 #         touch ~/.config/fbterm-background/disabled
 #   - FbTerm without background, once:  fbterm-background --no-background
@@ -399,7 +400,24 @@ open_fbterm() {
     else
         export FBTERM_BACKGROUND_IMAGE=1
     fi
-    exec fbterm -- /bin/bash -l
+    # FbTerm diagnostics go to a log file, never to the physical
+    # console. Anything the kernel console draws on the framebuffer
+    # before FbTerm captures it (e.g. the "[input] can't change
+    # kernel keymap table" warning, printed because FbTerm lacks
+    # CAP_SYS_TTY_CONFIG; see "man fbterm", SECURITY NOTES) would be
+    # baked into the background image and stay visible forever.
+    LOG_DIR="$HOME/.cache/fbterm-background"
+    mkdir -p "$LOG_DIR"
+    fbterm -- /bin/bash -l 2>"$LOG_DIR/fbterm.log"
+    FBTERM_STATUS=$?
+    # Re-show the kernel-console cursor (hidden while painting; see
+    # below). FbTerm draws its own cursor while it runs.
+    printf '\033[?25h'
+    if [ "$FBTERM_STATUS" -ne 0 ]; then
+        echo "fbterm-background: fbterm exited with status $FBTERM_STATUS; last log lines:" >&2
+        tail -n 20 "$LOG_DIR/fbterm.log" >&2 2>/dev/null || true
+    fi
+    exit "$FBTERM_STATUS"
 }
 
 if [ "$NO_BACKGROUND" -eq 1 ]; then
@@ -439,7 +457,9 @@ else
     "$IDUMP_BIN" "${IDUMP_ARGS[@]}" "$IMG" >/dev/null 2>&1
 fi
 IDUMP_STATUS=$?
-printf '\033[?25h'
+# The cursor stays hidden: if the kernel console drew its block
+# cursor now, FbTerm would capture it into the background image
+# (a permanent black square). open_fbterm restores it on exit.
 if [ "$IDUMP_STATUS" -ne 0 ]; then
     echo "fbterm-background: idump failed (status $IDUMP_STATUS); opening without a background." >&2
     sleep 2
@@ -563,7 +583,19 @@ elif [ -z "${FBTERM_FASTFETCH_DONE:-}" ]; then
     export FBTERM_FASTFETCH_DONE=1
     [ "${TERM:-}" = "linux" ] && export TERM=fbterm
     if command -v fastfetch >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then
+        # On a TTY, fastfetch wraps the Disk mountpoint in an OSC 8
+        # hyperlink (ESC ] 8 ;; file://...). FbTerm's escape parser
+        # predates OSC 8 and prints it as garbage ("Disk
+        # (://///;:;)"), so strip OSC sequences from its output.
+        # "--pipe false" keeps colors even though stdout is a pipe,
+        # and only OSC (ESC ]) is removed; colors (ESC [) survive.
+        if command -v perl >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 15 fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g' || true
+            else
+                fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g' || true
+            fi
+        elif command -v timeout >/dev/null 2>&1; then
             timeout 15 fastfetch || true
         else
             fastfetch || true
@@ -581,7 +613,7 @@ Done. How to try it:
      TTY:  ~/.local/bin/fbterm-background
   2) You will see your background image and fastfetch once inside
      FbTerm.
-  3) To exit FbTerm: Ctrl+Alt+E (this also ends the login session).
+  3) To exit FbTerm: type "exit" (this also ends the login session).
 
 Notes:
   - Image settings live in ~/.config/fbterm-background/config:
