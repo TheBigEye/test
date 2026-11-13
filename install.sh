@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.0.7"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -49,6 +49,15 @@ LAST_STAGE=0
 MOUNTS=()
 HELP_FN=""
 HELP_SHOWN=""
+HELP_FULL=0
+UI_COLOR=0
+UI_WIDTH=76
+C_RESET=""
+C_CYAN=""
+C_GREEN=""
+C_YELLOW=""
+C_RED=""
+C_DIM=""
 
 # ---------------------------- utilidades base ----------------------------
 
@@ -67,6 +76,96 @@ cmd_to_text() {
         printf -v out '%s %q' "$out" "$a"
     done
     printf '%s' "${out# }"
+}
+
+# ---------------------------- interfaz (consola pequeña) ----------------------------
+# Pensada para una consola de baja resolución (p. ej. 80x25 o la ventana
+# pequeña de QEMU): líneas cortas, resúmenes de como máximo 10 líneas por
+# bloque, explicación completa solo con ?, colores solo si hay TTY y
+# NO_COLOR no está definido, y animación breve solo en terminal real.
+# Sin TTY (salida capturada, tests, tuberías) todo queda en texto plano,
+# para que el log y la salida sigan siendo comparables byte a byte.
+
+ui_init() {
+    UI_WIDTH=76
+    if [[ -n "${COLUMNS:-}" && "${COLUMNS}" =~ ^[0-9]+$ ]] && (( COLUMNS >= 40 && COLUMNS < UI_WIDTH )); then
+        UI_WIDTH="$COLUMNS"
+    fi
+    if [[ -t 1 && "${TERM:-dumb}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
+        UI_COLOR=1
+        C_RESET=$'\033[0m'
+        C_CYAN=$'\033[1;36m'
+        C_GREEN=$'\033[1;32m'
+        C_YELLOW=$'\033[1;33m'
+        C_RED=$'\033[1;31m'
+        C_DIM=$'\033[2m'
+    else
+        UI_COLOR=0
+        C_RESET=""
+        C_CYAN=""
+        C_GREEN=""
+        C_YELLOW=""
+        C_RED=""
+        C_DIM=""
+    fi
+}
+
+ui_prompt() {
+    if (( UI_COLOR )); then
+        printf '%s> %s%s' "$C_CYAN" "$*" "$C_RESET"
+    else
+        printf '> %s' "$*"
+    fi
+}
+
+ui_rule() {
+    local line=""
+    printf -v line '%*s' "$UI_WIDTH" ''
+    printf '%s%s%s\n' "$C_DIM" "${line// /-}" "$C_RESET"
+}
+
+ui_banner() {
+    ui_init
+    printf '\n'
+    ui_rule
+    printf '  %sDEBIAN 13 TRIXIE%s  ·  instalador minimal\n' "$C_CYAN" "$C_RESET"
+    printf '  /dev/sda · LUKS2 · Limine UEFI+BIOS · Openbox o solo TTY\n'
+    printf '  %sv%s%s  ·  ? = ayuda completa  ·  Ctrl+C = cancelar\n' "$C_DIM" "$SCRIPT_VERSION" "$C_RESET"
+    ui_rule
+    ui_animation
+}
+
+ui_animation() {
+    (( UI_COLOR )) || return 0
+    (( DRY_RUN )) && return 0
+    [[ -t 1 ]] || return 0
+    # shellcheck disable=SC1003
+    local frames=('-' '\' '|' '/') i
+    for i in 0 1 2 3 4 5 6 7; do
+        printf '\r  %spreparando instalador %s%s' "$C_DIM" "${frames[i % 4]}" "$C_RESET"
+        sleep 0.06
+    done
+    printf '\r  %spreparando instalador listo%s\n' "$C_GREEN" "$C_RESET"
+}
+
+ui_progress() {
+    local n="${1:-0}" total=15 filled=0 bar="" empty=""
+    (( UI_COLOR )) || return 0
+    (( n >= 0 && n <= total )) || return 0
+    filled=$(( n * 24 / total ))
+    printf -v bar '%*s' "$filled" ''
+    bar="${bar// /#}"
+    printf -v empty '%*s' "$((24 - filled))" ''
+    empty="${empty// /-}"
+    printf '  %s[%s%s]%s etapa %d/%d\n' "$C_GREEN" "$bar" "$empty" "$C_RESET" "$n" "$total"
+}
+
+ui_stage_title() {
+    local n="$1" title="$2"
+    printf '\n'
+    ui_rule
+    printf '  %s[%02d/15]%s %s\n' "$C_CYAN" "$n" "$C_RESET" "$title"
+    ui_rule
 }
 
 run() {
@@ -271,6 +370,7 @@ mark_stage() {
     printf '%s\n' "$LAST_STAGE" > "$STATE_FILE" || die "No se puede guardar el estado en $STATE_FILE"
     save_config
     log "Etapa $LAST_STAGE completada"
+    ui_progress "$LAST_STAGE"
 }
 
 stage_done() {
@@ -366,7 +466,7 @@ validate_preferences() {
     in_set "$COMPOSITOR" picom ninguno || die "compositor inválido: $COMPOSITOR"
     in_set "$BAR" tint2 ninguno || die "barra inválida: $BAR"
     in_set "$LAUNCHER" rofi ninguno || die "lanzador inválido: $LAUNCHER"
-    in_set "$TERMINAL" xterm alacritty ambas || die "terminal inválida: $TERMINAL"
+    in_set "$TERMINAL" xterm alacritty ambas ninguno || die "terminal inválida: $TERMINAL"
     in_set "$FONT_PKG" fonts-jetbrains-mono fonts-dejavu-core xfonts-terminus || die "fuente inválida: $FONT_PKG"
     in_set "$PIPEWIRE" minimal bluetooth ninguno || die "PipeWire inválido: $PIPEWIRE"
     in_set "$NETWORK" NetworkManager dhcpcd ninguno || die "red inválida: $NETWORK"
@@ -394,6 +494,19 @@ validate_preferences() {
     if [[ "$GUI" == no && "$GREETER" != consola ]]; then
         die "Un greeter gráfico requiere X11; elige consola o activa GUI"
     fi
+    if [[ "$GUI" == no ]]; then
+        # Normalización dura, venga la configuración de preguntas,
+        # --config o --resume: sin X11 no queda NINGÚN resto gráfico
+        # en las preferencias, y build_packages() tampoco lo añade.
+        WM=ninguno
+        COMPOSITOR=ninguno
+        BAR=ninguno
+        LAUNCHER=ninguno
+        TERMINAL=ninguno
+    fi
+    if [[ "$GUI" == si && "$TERMINAL" == ninguno ]]; then
+        die "Con GUI=si necesitas una terminal gráfica (xterm, alacritty o ambas)"
+    fi
     if (( ! DRY_RUN && ! SIMULATE )); then
         [[ -z "$K" || "$K" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ABI de kernel inválido: $K"
         for k in LUKS_UUID ROOT_UUID BOOT_UUID; do
@@ -412,10 +525,40 @@ validate_preferences() {
 
 show_help() {
     [[ -n "$HELP_FN" ]] || return 0
+    ui_init
+    # ? pide la explicación COMPLETA: se pagina con less si hay TTY,
+    # porque en una consola de baja resolución un bloque entero se sale
+    # de la pantalla. --explain sigue imprimiendo todo sin paginar.
+    if (( HELP_FULL )); then
+        HELP_FULL=0
+        printf '\n'
+        if [[ -t 1 ]] && command -v less >/dev/null 2>&1; then
+            "$HELP_FN" | less -FXR
+        else
+            "$HELP_FN"
+        fi
+        printf '\n'
+        HELP_SHOWN="$HELP_FN"
+        return 0
+    fi
+    # Primera vez: SOLO un resumen que cabe en una pantalla pequeña
+    # (máximo 10 líneas del bloque + una línea de estado). El detalle
+    # completo, con coste/riesgo/fuentes, queda a una tecla (?) y en
+    # --explain. Así no se pierde información, pero tampoco se empuja
+    # la pregunta fuera de la pantalla.
     if [[ "$HELP_SHOWN" != "$HELP_FN" ]]; then
+        local text="" i
+        local -a lines=()
+        text="$("$HELP_FN")"
+        mapfile -t lines <<< "$text"
         printf '\n'
-        "$HELP_FN"
-        printf '\n'
+        ui_rule
+        for i in "${!lines[@]}"; do
+            (( i < 10 )) || break
+            printf '  %s\n' "${lines[i]}"
+        done
+        printf '  %s[?] explicación completa (%d líneas) · Enter = valor por defecto%s\n' "$C_DIM" "${#lines[@]}" "$C_RESET"
+        ui_rule
         HELP_SHOWN="$HELP_FN"
     fi
 }
@@ -449,6 +592,15 @@ Que NO existe en este diseno:
   - No se lee ni se escribe nada en el anfitrion.
   - No se genera ningun archivo para el anfitrion.
   - El script no se copia a si mismo dentro del sistema instalado.
+
+Interfaz (pensada para una consola de baja resolucion):
+  Antes de cada bloque veras SOLO un resumen de 10 lineas como maximo,
+  que cabe en una pantalla pequena. Pulsa ? en la pregunta para abrir
+  la explicacion completa paginada con less; con --explain se imprime
+  todo de una vez. Hay colores y una barra de progreso solo si la
+  salida es una terminal real; con NO_COLOR=1 o salida capturada todo
+  queda en texto plano. Estilo tipo Arch: banner corto, menus
+  numerados, minimo ruido y ninguna pregunta sin valor por defecto.
 
 Donde vive todo durante la instalacion:
   /tmp de Debian 13 es tmpfs (RAM). Ahi estan el log, el estado, los
@@ -942,6 +1094,9 @@ help_limine() {
     cat <<'EOF'
 === Limine: bootloader upstream ===
 
+Decision rapida: el kernel se actualiza SOLO con el hook
+zz-limine-update; --refresh-limine queda solo como rescate.
+
 Limine NO es paquete Debian; se baja v12.9.6 desde GitHub, se verifica
 SHA-256 y (por defecto) la firma GPG con clave
 05D29860D0A0668AAEFB9D691F3C021BECA23821 en un homedir temporal. Luego se
@@ -953,8 +1108,24 @@ compila la herramienta `limine` y se instalan:
 limine.conf usa opciones documentadas: timeout, default_entry,
 editor_enabled, interface_branding, term_palette/term_background/
 term_foreground, protocol: linux, path: boot():/vmlinuz-ABI, cmdline y
-module_path: boot():/initrd.img-ABI. Las rutas son VERSIONADAS: por eso
-existe --refresh-limine para cuando el kernel se actualice.
+module_path: boot():/initrd.img-ABI. Las rutas son VERSIONADAS, pero
+ya NO dependes de acordarte de --refresh-limine:
+
+Actualizacion AUTOMATICA (v2.1.0): el sistema instalado recibe el hook
+zz-limine-update (0755) en tres sitios:
+  /etc/kernel/postinst.d/       al instalar/actualizar un kernel
+  /etc/kernel/postrm.d/         al borrar un kernel
+  /etc/initramfs/post-update.d/ tras crear/actualizar un initramfs
+Debian ejecuta los hooks de bootloader con prefijo zz- AL FINAL, con
+$1=ABI y $2=ruta de la imagen. El hook recalcula el ultimo par
+vmlinuz-*/initrd.img-* presente (no confia solo en $1, para cubrir
+tambien el borrado), reescribe /boot/limine.conf y su copia UEFI, y
+si /boot no esta montado o no hay par valido avisa y sale con 0 para
+no romper apt. /boot es FAT32 y no admite symlinks utiles para
+Limine, por eso se reescriben las rutas en vez de enlazar archivos
+sin version. --refresh-limine queda SOLO como rescate desde el
+live: sistema que no arranca, hook borrado, o una USB creada con
+una version anterior (una sola ejecucion lo deja automatico).
 
 editor_enabled=yes te permite editar cmdline en el menu (util para
 recuperarte). Si lo desactivas, ganas un poco de "endurecimiento" pero
@@ -965,6 +1136,8 @@ Recomendado: verificar GPG SI, editor SI, UEFI x64 SI, BIOS SI, IA32 NO.
 Fuente: https://github.com/Limine-Bootloader/Limine/releases/tag/v12.9.6
 Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/CONFIG.md
 Fuente: https://github.com/Limine-Bootloader/Limine/blob/trunk/USAGE.md
+Fuente: https://kernel-team.pages.debian.net/kernel-handbook/ch-update-hooks.html
+Fuente: https://manpages.debian.org/trixie/linux-base/linux-run-hooks.1.en.html
 EOF
 }
 
@@ -989,8 +1162,10 @@ greetd + tuigreet (ALTERNATIVA EMPAQUETADA, mas robusta):
   con vt=7 y usuario _greetd (que crea el paquete).
 
 consola:
-  Sin gestor grafico: login en TTY y `startx` manual. Minimo absoluto.
-  Solo valido si tambien elegiste GUI=no.
+  Sin gestor grafico: login en TTY y `startx` manual si hay GUI.
+  Minimo absoluto. Si elegiste GUI=no en la pregunta anterior, el
+  script ya puso GREETER=consola automaticamente y ni siquiera
+  veras este menu: sin X11 no hay greeter grafico posible.
 
 Discrepancia documental detectada: el README del tag v1.5.0 dice Zig
 0.16.x, pero build.zig.zon exige 0.17.0. La combinacion que REALMENTE
@@ -1012,6 +1187,9 @@ help_gui() {
     cat <<'EOF'
 === Entorno grafico X11 ligero ===
 
+Decision rapida: GUI=si = Xorg + Openbox ligero. GUI=no = solo TTY,
+CERO paquetes X11 y sin /etc/X11 (corregido en v2.1.0).
+
 Si GUI=si se instala Xorg minimo (xserver-xorg-core, drivers de entrada
 y video, libgl1-mesa-dri, xauth, xinit) mas, segun elijas:
   WM         openbox (tema Nightmare incluido en el paquete) o ninguno.
@@ -1027,16 +1205,29 @@ Es estetica "hacker" VISUAL y funcional: colores, monoespaciada, atajos.
 NO se instalan herramientas de intrusion, escaneo ni exploiting. No hay
 escritorio pesado (GNOME/KDE/XFCE), ni servicios de telemetria.
 
-Si GUI=no, no tiene sentido un greeter grafico: el script te obligara a
-elegir "consola" mas arriba. Aun asi tendras Plymouth, ZRAM, red y TTY.
+Si GUI=no (corregido en v2.1.0, antes instalaba X11 igual):
+  - La lista de paquetes NO contiene xserver-xorg-*, x11-xkb-utils,
+    x11-xserver-utils, xauth, xinit, libgl1-mesa-dri, Openbox, picom,
+    tint2, rofi, feh, xterm ni alacritty, ni siquiera como resto:
+    x11-xkb-utils arrastra libx11-6 y otras bibliotecas X11, por lo
+    que vivia SOLO dentro de la rama GUI=si.
+  - No se crea /etc/X11, ni .Xresources, ni config de Openbox; la
+    etapa 13 se omite entera y GREETER queda en consola.
+  - El teclado de CONSOLA lo sigue gestionando console-setup /
+    keyboard-configuration, que no es X11.
+  - Siguen Plymouth (framebuffer del arranque, no X11), ZRAM, red y
+    audio solo si los eliges aparte. Es la opcion "solo TTY", limpia
+    de verdad, estilo Arch sin entorno grafico.
 
-Coste aproximado: 150-250 MB y ~40 paquetes mas. En una USB de 59 GB
-es irrelevante; en RAM de la VM si importa durante la instalacion.
+Coste aproximado de GUI=si: 150-250 MB y ~40 paquetes mas. En una USB
+de 59 GB es irrelevante; en RAM de la VM si importa al instalar.
 
 Recomendado: GUI=si con Openbox + picom + tint2 + rofi + xterm.
-Para depurar un arranque fallido, GUI=no es mas facil.
+Para un sistema solo de consola, o depurar un arranque, GUI=no.
 Fuente: https://packages.debian.org/trixie/openbox
 Fuente: https://packages.debian.org/trixie/tuigreet
+Fuente: https://packages.debian.org/trixie/x11-xkb-utils
+Fuente: https://packages.debian.org/trixie/x11-xserver-utils
 EOF
 }
 
@@ -1353,8 +1544,9 @@ ask() {
     fi
     while true; do
         show_help
-        IFS= read -r -p "$prompt [$default] (? repite ayuda): " ans || die "Entrada cancelada"
+        IFS= read -r -p "$(ui_prompt "$prompt [$default] (? ayuda completa): ")" ans || die "Entrada cancelada"
         if [[ "$ans" == "?" ]]; then
+            HELP_FULL=1
             HELP_SHOWN=""
             continue
         fi
@@ -1379,8 +1571,9 @@ ask_yes() {
     fi
     while true; do
         show_help
-        IFS= read -r -p "$prompt [s/n, por defecto $default, ? ayuda]: " ans || die "Entrada cancelada"
+        IFS= read -r -p "$(ui_prompt "$prompt [s/n, por defecto $default, ? ayuda]: ")" ans || die "Entrada cancelada"
         if [[ "$ans" == "?" ]]; then
+            HELP_FULL=1
             HELP_SHOWN=""
             continue
         fi
@@ -1407,12 +1600,17 @@ menu() {
     fi
     while true; do
         show_help
-        printf '%s\n' "$prompt"
+        printf '  %s%s%s\n' "$C_CYAN" "$prompt" "$C_RESET"
         for i in "${!opts[@]}"; do
-            printf '  %d) %s\n' "$((i+1))" "${opts[i]}"
+            if (( i + 1 == default_num )); then
+                printf '  %s%d) %s%s  (por defecto)\n' "$C_GREEN" "$((i+1))" "${opts[i]}" "$C_RESET"
+            else
+                printf '  %d) %s\n' "$((i+1))" "${opts[i]}"
+            fi
         done
-        IFS= read -r -p "Elige 1-${#opts[@]} [${default_num}], ? repite ayuda: " ans || die "Entrada cancelada"
+        IFS= read -r -p "$(ui_prompt "Elige 1-${#opts[@]} [${default_num}], ? ayuda completa: ")" ans || die "Entrada cancelada"
         if [[ "$ans" == "?" ]]; then
+            HELP_FULL=1
             HELP_SHOWN=""
             continue
         fi
@@ -1447,7 +1645,7 @@ check_secret() {
         die "La contraseña tiene $len caracteres, pero el mínimo configurado es $min (cámbialo en la pregunta de longitud mínima)"
     fi
     if (( len < 12 )); then
-        printf 'ADVERTENCIA: contraseña de %d caracteres; es corta y vulnerable a fuerza bruta. No se bloquea, solo se avisa.\n' "$len" >&2
+        printf '%sADVERTENCIA: contraseña de %d caracteres; es corta y vulnerable a fuerza bruta. No se bloquea, solo se avisa.%s\n' "${C_YELLOW:-}" "$len" "${C_RESET:-}" >&2
     fi
 }
 
@@ -1460,16 +1658,17 @@ ask_secret() {
     fi
     while true; do
         show_help
-        IFS= read -r -s -p "$prompt (Enter vacío = releer ayuda): " a || die "Entrada cancelada"
+        IFS= read -r -s -p "$(ui_prompt "$prompt (Enter vacío = ayuda completa): ")" a || die "Entrada cancelada"
         printf '\n'
         # '?' puede ser una contraseña válida; usamos la entrada vacía
         # (que de todos modos no sería una contraseña válida) como ayuda.
         if [[ -z "$a" ]]; then
+            HELP_FULL=1
             HELP_SHOWN=""
-            printf 'Mostrando de nuevo la explicación.\n'
+            printf 'Mostrando la explicación completa.\n'
             continue
         fi
-        IFS= read -r -s -p "Repite $prompt: " b || die "Entrada cancelada"
+        IFS= read -r -s -p "$(ui_prompt "Repite $prompt: ")" b || die "Entrada cancelada"
         printf '\n'
         check_secret "$a"
         [[ "$a" == "$b" ]] || { printf 'No coincide.\n'; continue; }
@@ -1525,7 +1724,7 @@ confirm_wipe() {
     HELP_FN=help_confirm
     HELP_SHOWN=""
     show_help
-    printf '\n=== PELIGRO ===\nSe borrará por completo %s.\n' "$U"
+    printf '\n%s=== PELIGRO ===%s\nSe borrará por completo %s.\n' "$C_RED" "$C_RESET" "$U"
     lsblk -d -o NAME,MODEL,SERIAL,SIZE,TRAN,HOTPLUG "$U"
     IFS= read -r -p "Escribe exactamente BORRAR $U para continuar: " ans || die "Cancelado"
     [[ "$ans" == "BORRAR $U" ]] || die "No se confirmó el borrado"
@@ -1737,12 +1936,28 @@ collect_preferences() {
     ask_yes LIMINE_EDITOR "Permitir editor de Limine" "si"
     ask_yes VERIFY_GPG "Verificar firma GPG de Limine" "si"
 
-    HELP_FN=help_greeter;    HELP_SHOWN=""
-    menu GREETER "Gestor de inicio de sesión" 1 "greetd" "ly" "consola"
+    # Primero se pregunta si hay X11 y DESPUÉS el greeter: al revés,
+    # elegir greetd/ly y luego GUI=no era un callejón sin salida.
     HELP_FN=help_gui;        HELP_SHOWN=""
-    ask_yes GUI "Instalar entorno gráfico X11" "si"
-    if [[ "$GUI" == "no" && "$GREETER" != "consola" ]]; then
-        die "Un greeter gráfico requiere X11; elige consola o activa GUI"
+    # El default es el valor ACTUAL ($GUI), no un "si" fijo: así un
+    # --config con GUI=no seguido de --yes no vuelve a activar X11.
+    ask_yes GUI "Instalar entorno gráfico X11" "$GUI"
+    if [[ "$GUI" == no ]]; then
+        GREETER=consola
+        WM=ninguno
+        COMPOSITOR=ninguno
+        BAR=ninguno
+        LAUNCHER=ninguno
+        TERMINAL=ninguno
+        log "GUI=no: greeter=consola y sin ningún componente gráfico"
+    else
+        HELP_FN=help_greeter;    HELP_SHOWN=""
+        local_greeter_default=1
+        case "$GREETER" in
+            ly) local_greeter_default=2 ;;
+            consola) local_greeter_default=3 ;;
+        esac
+        menu GREETER "Gestor de inicio de sesión" "$local_greeter_default" "greetd" "ly" "consola"
     fi
     if [[ "$GUI" == si ]]; then
         menu WM "WM" 1 "openbox" "ninguno"
@@ -1863,6 +2078,17 @@ self_check() {
         'meta l4proto icmp accept'
         'meta l4proto ipv6-icmp accept'
         'BIOSP=/dev/sda1'
+        'install_limine_auto_hook'
+        'zz-limine-update'
+        '/etc/kernel/postinst.d/zz-limine-update'
+        '/etc/kernel/postrm.d/zz-limine-update'
+        '/etc/initramfs/post-update.d/zz-limine-update'
+        'GUI=no confirmado: sin Xorg'
+        'GUI=no: no se crea /etc/X11 en el sistema instalado'
+        'xserver-xorg-core xserver-xorg-input-all xserver-xorg-video-all xauth xinit x11-xkb-utils x11-xserver-utils libgl1-mesa-dri mesa-utils'
+        'ui_banner'
+        'ui_progress'
+        'HELP_FULL=1'
     )
     local c
     for c in "${checks[@]}"; do
@@ -1878,6 +2104,8 @@ self_check() {
     local banned20="wipe""fs -a \"" banned21="for part in \"\$BIOSP\" \"\$B\" \"\$R\""
     local banned22="Compo""nents: \$COMPONENTS"
     local banned23="ip6 nexthdr ipv6""-icmp"
+    local banned24="        x11""-xkb-utils x11-xserver-utils"
+    local banned25="curl wget gnupg xz-utils zstd less nano htop pciutils usbutils x11""-"
     grep -qF -- "$banned1" "$0" && die "Quedan marcadores prohibidos"
     grep -qF -- "$banned2" "$0" && die "Queda ruta de respaldo anterior"
     grep -qF -- "$banned3" "$0" && die "Kernel inexistente en Debian detectado"
@@ -1901,6 +2129,8 @@ self_check() {
     grep -qF -- "$banned21" "$0" && die "Vuelve la limpieza de ESP/LUKS en etapa 2"
     grep -qF -- "$banned22" "$0" && die "Vuelve Components con comas en deb822"
     grep -qF -- "$banned23" "$0" && die "Vuelve ip6 nexthdr ipv6""-icmp sin netbase"
+    grep -qF -- "$banned24" "$0" && die "Vuelven paquetes X11 en la lista base (GUI=no instalaria X11)"
+    grep -qF -- "$banned25" "$0" && die "Vuelve X11 pegado a la lista base de paquetes"
     grep -q -- 'run sgdisk --zap-all' "$0" || die "Falta trazabilidad de sgdisk"
     grep -q -- 'run cryptsetup luksFormat' "$0" || die "Falta trazabilidad de luksFormat"
     grep -q -- 'run mkfs.fat' "$0" || die "Falta trazabilidad de mkfs.fat"
@@ -2083,11 +2313,17 @@ ensure_target_dirs() {
     run mkdir -p \
         "$M/etc/apt/sources.list.d" \
         "$M/etc/initramfs-tools/conf.d" \
-        "$M/etc/X11/xorg.conf.d" \
         "$M/etc/systemd" \
-        "$M/etc/greetd" \
         "$M/boot/EFI/BOOT" \
         "$M/dev" "$M/proc" "$M/sys" "$M/run"
+    # Sin X11 no se crea ni siquiera el directorio /etc/X11 vacío,
+    # y sin greetd no se crea /etc/greetd: nada de restos gráficos.
+    if [[ "$GUI" == si ]]; then
+        run mkdir -p "$M/etc/X11/xorg.conf.d"
+    fi
+    if [[ "$GREETER" == greetd ]]; then
+        run mkdir -p "$M/etc/greetd"
+    fi
 }
 
 ensure_chroot_mounts() {
@@ -2298,6 +2534,11 @@ stage_5_sources() {
 }
 
 build_packages() {
+    # REGLA DURA: ningún paquete X11 puede estar en la lista base.
+    # x11-xkb-utils depende de libx11-6/libxaw7/libxrandr2/libxt6t64
+    # y x11-xserver-utils de otras bibliotecas X11: antes estaban
+    # aquí sin condición y por eso GUI=no instalaba X11 igualmente.
+    # Todo lo gráfico vive SOLO dentro del bloque GUI=si de abajo.
     PKGS=(
         apt debian-archive-keyring ca-certificates systemd-sysv locales tzdata
         keyboard-configuration console-setup sudo coreutils util-linux
@@ -2305,7 +2546,6 @@ build_packages() {
         linux-image-amd64 initramfs-tools cryptsetup cryptsetup-initramfs
         systemd-zram-generator plymouth plymouth-themes plymouth-label
         curl wget gnupg xz-utils zstd less nano htop pciutils usbutils
-        x11-xkb-utils x11-xserver-utils
     )
     [[ "$USER_SHELL" == /bin/zsh ]] && PKGS+=(zsh)
     [[ "$ROOT_FS" == btrfs ]] && PKGS+=(btrfs-progs)
@@ -2334,7 +2574,7 @@ build_packages() {
     [[ "$GREETER" == greetd ]] && PKGS+=(greetd tuigreet)
     [[ "$GREETER" == ly ]] && PKGS+=(libpam0g libxcb1 libxcb-xkb1 libaudit1 brightnessctl)
     if [[ "$GUI" == si ]]; then
-        PKGS+=(xserver-xorg-core xserver-xorg-input-all xserver-xorg-video-all xauth xinit libgl1-mesa-dri mesa-utils "$FONT_PKG")
+        PKGS+=(xserver-xorg-core xserver-xorg-input-all xserver-xorg-video-all xauth xinit x11-xkb-utils x11-xserver-utils libgl1-mesa-dri mesa-utils "$FONT_PKG")
         [[ "$WM" == openbox ]] && PKGS+=(openbox)
         [[ "$COMPOSITOR" == picom ]] && PKGS+=(picom)
         [[ "$BAR" == tint2 ]] && PKGS+=(tint2)
@@ -2354,6 +2594,9 @@ stage_6_packages() {
     write_lines "$M/etc/initramfs-tools/conf.d/zz-minimal.conf" \
         'MODULES=most' 'BUSYBOX=y' 'KEYMAP=y' 'RESUME=none' 'UMASK=0077'
     build_packages
+    if [[ "$GUI" == no ]]; then
+        log "GUI=no confirmado: sin Xorg, sin paquetes x11-*, sin Openbox ni terminales gráficas"
+    fi
     log "Paquetes seleccionados: ${PKGS[*]}"
     run chroot "$M" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get -s install --no-install-recommends "${PKGS[@]}"
     run chroot "$M" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS[@]}"
@@ -2396,10 +2639,14 @@ stage_7_system_config() {
         'FONTFACE="Terminus"' 'FONTSIZE="8x16"' 'VIDEOMODE=""'
     run chroot "$M" /usr/bin/setupcon --save-only
     ensure_target_dirs
-    write_lines "$M/etc/X11/xorg.conf.d/00-keyboard.conf" \
-        'Section "InputClass"' '    Identifier "system-keyboard"' \
-        '    MatchIsKeyboard "on"' '    Option "XkbModel" "pc105"' \
-        "    Option \"XkbLayout\" \"$KEYMAP\"" 'EndSection'
+    if [[ "$GUI" == si ]]; then
+        write_lines "$M/etc/X11/xorg.conf.d/00-keyboard.conf" \
+            'Section "InputClass"' '    Identifier "system-keyboard"' \
+            '    MatchIsKeyboard "on"' '    Option "XkbModel" "pc105"' \
+            "    Option \"XkbLayout\" \"$KEYMAP\"" 'EndSection'
+    else
+        log "GUI=no: no se crea /etc/X11 en el sistema instalado"
+    fi
     write_lines "$M/etc/hostname" "$HOSTNAME_DEB"
     write_lines "$M/etc/hosts" \
         '127.0.0.1 localhost' "127.0.1.1 $HOSTNAME_DEB" \
@@ -2436,6 +2683,47 @@ kernel_cmdline() {
     else
         printf '%s quiet splash %s\n' "$base" "$hard"
     fi
+}
+
+# Actualización AUTOMÁTICA de limine.conf cuando cambia el kernel.
+# Debian ejecuta los hooks de /etc/kernel/postinst.d y postrm.d con
+# run-parts, con $1=ABI del kernel y $2=ruta de la imagen; los hooks de
+# bootloader deben llamarse zz-* para ejecutarse AL FINAL, y los de
+# /etc/initramfs/post-update.d se llaman tras crear/actualizar/borrar
+# un initramfs (Debian Kernel Handbook, cap. 8). El hook NO confía en
+# $1: recalcula el último par vmlinuz-*/initrd.img-* PRESENTE, así
+# también cubre el borrado de un kernel viejo (postrm). Si /boot no
+# está montado o no hay un par válido, avisa por stderr y sale 0 para
+# no romper la transacción de apt. /boot es FAT32, que no admite
+# symlinks útiles para Limine: por eso se reescriben las rutas
+# versionadas en vez de enlazar vmlinuz/initrd.img sin versión.
+# shellcheck disable=SC2016
+install_limine_auto_hook() {
+    local hook="$M/etc/kernel/postinst.d/zz-limine-update"
+    run mkdir -p "$M/etc/kernel/postinst.d" "$M/etc/kernel/postrm.d" "$M/etc/initramfs/post-update.d"
+    write_lines "$hook" \
+        '#!/bin/sh' \
+        '# zz-limine-update: apunta limine.conf al ultimo kernel presente.' \
+        '# Lo ejecutan los hooks de kernel/initramfs de Debian (zz- = al final).' \
+        '# Si no hay par vmlinuz/initrd valido, avisa y sale 0: nunca rompe apt.' \
+        'set -u' \
+        'CONF=/boot/limine.conf' \
+        'EFI_CONF=/boot/EFI/BOOT/limine.conf' \
+        'if [ ! -f "$CONF" ]; then echo "zz-limine-update: no existe $CONF; se omite" >&2; exit 0; fi' \
+        'latest=$(for f in /boot/vmlinuz-*; do [ -f "$f" ] || continue; v=${f#/boot/vmlinuz-}; if [ -f "/boot/initrd.img-$v" ]; then echo "$v"; fi; done | sort -V | tail -n 1)' \
+        'if [ -z "$latest" ]; then echo "zz-limine-update: no hay par vmlinuz/initrd en /boot; se omite" >&2; exit 0; fi' \
+        'tmp="/boot/.limine.conf.tmp.$$"' \
+        'if ! sed -E "s/vmlinuz-[^[:space:]]+/vmlinuz-$latest/g; s/initrd\.img-[^[:space:]]+/initrd.img-$latest/g" "$CONF" > "$tmp"; then echo "zz-limine-update: sed fallo; no se toca limine.conf" >&2; rm -f "$tmp"; exit 0; fi' \
+        'cat "$tmp" > "$CONF"' \
+        'rm -f "$tmp"' \
+        'mkdir -p /boot/EFI/BOOT' \
+        'cat "$CONF" > "$EFI_CONF"' \
+        'echo "zz-limine-update: limine.conf apunta al kernel $latest" >&2' \
+        'exit 0'
+    run cp "$hook" "$M/etc/kernel/postrm.d/zz-limine-update"
+    run cp "$hook" "$M/etc/initramfs/post-update.d/zz-limine-update"
+    run chmod 0755 "$hook" "$M/etc/kernel/postrm.d/zz-limine-update" "$M/etc/initramfs/post-update.d/zz-limine-update"
+    log "Limine automático: hook zz-limine-update instalado en kernel/postinst.d, kernel/postrm.d e initramfs/post-update.d"
 }
 
 stage_9_limine() {
@@ -2492,6 +2780,7 @@ stage_9_limine() {
     # puede ser sombreado por otro candidato en otra partición.
     run mkdir -p "$M/boot/EFI/BOOT"
     run cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
+    install_limine_auto_hook
     run sync
     if [[ "$BIOS_BOOT" == si ]]; then
         # Otra vez aqui: con --resume la etapa 2 no se repite.
@@ -2586,7 +2875,11 @@ stage_12_greeter() {
 
 stage_13_desktop() {
     log "=== Etapa 13: escritorio ==="
-    if [[ "$GUI" != si ]]; then mark_stage 13; return 0; fi
+    if [[ "$GUI" != si ]]; then
+        log "GUI=no: etapa de escritorio omitida (sin X11)"
+        mark_stage 13
+        return 0
+    fi
     ensure_chroot_mounts
     local home="$M/home/$USERNAME"
     run install -d "$home/.config/openbox" "$home/.config/tint2"
@@ -2672,7 +2965,8 @@ final_summary() {
     log "Para probar el arranque, reinicia la VM desde /dev/sda sin el ISO."
     log "Prueba primero UEFI y despues BIOS/Legacy; ambas rutas estan instaladas."
     log "Si la pantalla se queda negra con Plymouth, elige la entrada 'texto' de Limine."
-    log "Si el kernel se actualiza: sudo bash $SCRIPT_NAME --refresh-limine"
+    log "Kernel futuro: se actualiza SOLO (hook zz-limine-update en el sistema)."
+    log "--refresh-limine queda solo como rescate desde el live, no como rutina."
     log "Tu configuracion de QEMU sigue siendo ajena a este script y no ha sido revisada."
 }
 
@@ -2696,6 +2990,7 @@ refresh_limine() {
         run sed -i "s#vmlinuz-SIMULADO-K#vmlinuz-$K#g" "$M/boot/limine.conf"
         run sed -i "s#initrd.img-SIMULADO-K#initrd.img-$K#g" "$M/boot/limine.conf"
         run cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
+        install_limine_auto_hook
         run umount -R "$M"
         run cryptsetup close cryptroot
         log "limine.conf actualizado en simulación; este script no quedó en el sistema instalado"
@@ -2715,6 +3010,7 @@ refresh_limine() {
     [[ -n "$K" && "$K" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ABI de kernel inválido: $K"
     sed -i -E "s#(path: boot\(\):/)vmlinuz-[^ ]+#\1vmlinuz-$K#; s#(module_path: boot\(\):/)initrd.img-[^ ]+#\1initrd.img-$K#" "$M/boot/limine.conf"
     cp "$M/boot/limine.conf" "$M/boot/EFI/BOOT/limine.conf"
+    install_limine_auto_hook
     cp "$M/boot/limine.conf" "$ARTIFACT_DIR/limine.conf" 2>/dev/null || true
     sync
     umount -R "$M"
@@ -2739,7 +3035,10 @@ Uso: install.sh [OPCIONES]
                           contraseñas y la confirmación literal de borrado.
   --config ARCHIVO        Carga preferencias no secretas guardadas en RAM.
   --resume                Continúa desde la última etapa guardada EN ESTA SESIÓN.
-  --refresh-limine        Abre la USB y actualiza rutas versionadas de kernel.
+  --refresh-limine        RESCATE manual: abre la USB, corrige rutas de kernel
+                          e instala el hook automático zz-limine-update.
+                          En una instalación v2.1.0+ NO hace falta tras
+                          actualizar el kernel: el hook lo hace solo.
   --log ARCHIVO           Ruta del log (por defecto en artifacts/ de /tmp).
   --version               Muestra versión.
   -h, --help              Esta ayuda.
@@ -2802,6 +3101,7 @@ main() {
     set_defaults
     derive_paths
     init_dirs
+    ui_init
 
     if (( EXPLAIN_ONLY )); then
         help_all
@@ -2814,10 +3114,12 @@ main() {
         exit 0
     fi
     if (( REFRESH_LIMINE )); then
+        ui_banner
         refresh_limine
         exit 0
     fi
 
+    ui_banner
     log "=== $SCRIPT_NAME $SCRIPT_VERSION ==="
     log "Fecha: $(date -Is)"
     if (( DRY_RUN )); then log "MODO SIMULACIÓN: no se ejecutará ninguna orden con efectos"; fi
