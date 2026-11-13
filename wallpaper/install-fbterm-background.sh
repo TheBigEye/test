@@ -400,15 +400,18 @@ open_fbterm() {
     else
         export FBTERM_BACKGROUND_IMAGE=1
     fi
-    # FbTerm diagnostics go to a log file, never to the physical
-    # console. Anything the kernel console draws on the framebuffer
-    # before FbTerm captures it (e.g. the "[input] can't change
-    # kernel keymap table" warning, printed because FbTerm lacks
+    # FbTerm diagnostics (stdout AND stderr: the "[input] can't
+    # change kernel keymap table" warning is printed with printf)
+    # go to a log file, never to the physical console. Anything the
+    # kernel console draws on the framebuffer before FbTerm captures
+    # it (that warning appears because FbTerm lacks
     # CAP_SYS_TTY_CONFIG; see "man fbterm", SECURITY NOTES) would be
     # baked into the background image and stay visible forever.
+    # FbTerm itself draws on /dev/fb0 and its shell gets a pty, so
+    # redirecting the fbterm process's own stdout is harmless.
     LOG_DIR="$HOME/.cache/fbterm-background"
     mkdir -p "$LOG_DIR"
-    fbterm -- /bin/bash -l 2>"$LOG_DIR/fbterm.log"
+    fbterm -- /bin/bash -l >"$LOG_DIR/fbterm.log" 2>&1
     FBTERM_STATUS=$?
     # Re-show the kernel-console cursor (hidden while painting; see
     # below). FbTerm draws its own cursor while it runs.
@@ -587,13 +590,17 @@ elif [ -z "${FBTERM_FASTFETCH_DONE:-}" ]; then
         # hyperlink (ESC ] 8 ;; file://...). FbTerm's escape parser
         # predates OSC 8 and prints it as garbage ("Disk
         # (://///;:;)"), so strip OSC sequences from its output.
-        # "--pipe false" keeps colors even though stdout is a pipe,
-        # and only OSC (ESC ]) is removed; colors (ESC [) survive.
+        # The filter also translates bright SGR colors (90-97 text,
+        # 100-107 background), which FbTerm ignores, into its
+        # classic model: bold+30-37 = bright text, blink+40-47 =
+        # bright background. Without this, fastfetch's second
+        # Colors row (bright backgrounds) renders as uniform gray.
+        # "--pipe false" keeps colors even though stdout is a pipe.
         if command -v perl >/dev/null 2>&1; then
             if command -v timeout >/dev/null 2>&1; then
-                timeout 15 fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g' || true
+                timeout 15 fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g; s/\x1b\[([0-9;]*)m/ my $p=$1; my @a=split(q{;},$p,-1); my $pre=""; @a=map { if ($_ >= 100 && $_ <= 107) { $pre="5;"; $_ - 60 } elsif ($_ >= 90 && $_ <= 97) { $pre="1;"; $_ - 60 } else { $_ } } @a; "\x1b[" . $pre . join(";", @a) . "m" /ge' || true
             else
-                fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g' || true
+                fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g; s/\x1b\[([0-9;]*)m/ my $p=$1; my @a=split(q{;},$p,-1); my $pre=""; @a=map { if ($_ >= 100 && $_ <= 107) { $pre="5;"; $_ - 60 } elsif ($_ >= 90 && $_ <= 97) { $pre="1;"; $_ - 60 } else { $_ } } @a; "\x1b[" . $pre . join(";", @a) . "m" /ge' || true
             fi
         elif command -v timeout >/dev/null 2>&1; then
             timeout 15 fastfetch || true
