@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # compile-idump.sh - Rebuild the idump viewer from the included source
-# code (idump-0.2.0.tar.gz, MIT license, by uobikiemukot/idump).
+# code (idump-0.2.0.tar.gz, MIT license, by uobikiemukot/idump, plus a
+# small local patch adding centered fit, true cover scaling and a
+# brightness option: idump -c/-f -d PERCENT).
 #
 # Only needed if the included "idump" binary does not run on your
 # machine (for example, if your architecture is not x86_64).

@@ -5,8 +5,9 @@
 # Sets an image as the TTY background (no X11, no Wayland, no window
 # manager) using only:
 #   - fbterm    (Debian trixie 1.7-5)  framebuffer terminal emulator
-#   - idump     (included static binary, 809 KB, no dependencies)
-#               tiny viewer that paints the image on /dev/fb0 and exits
+#   - idump     (included patched static binary, no dependencies)
+#               tiny viewer that paints the image on /dev/fb0 and exits;
+#               this build adds true "cover" scaling and darkening
 #   - fastfetch (Debian trixie 2.40.4) runs once when the session starts
 #
 # Why not fbi?
@@ -18,9 +19,16 @@
 #   much just to paint one image. idump does exactly that (paint and
 #   exit) in a single static binary: MIT source included in
 #   idump-0.2.0.tar.gz, rebuildable with ./compile-idump.sh. Without
-#   fbi there is no need for ImageMagick either: this folder ships
-#   wallpaper-16x9.png, the image already cropped to 1920x1080 and
-#   darkened by 18% so text stays readable.
+#   fbi there is no need for ImageMagick either: idump scales/crops
+#   the original image to the real framebuffer size at login and
+#   darkens it (45% brightness by default) so text stays readable.
+#
+# Font:
+#   FbTerm cannot load kernel PSF console fonts. This package ships
+#   Default8x16.bdf, converted from Debian console-data's classic
+#   default8x16.psf.gz (8x16 pixels, 256 glyphs), plus a fontconfig
+#   rule that accepts only this bitmap font. The result is the
+#   classic crisp console look instead of an antialiased vector font.
 #
 # How it works:
 #   FbTerm does not read image files: if FBTERM_BACKGROUND_IMAGE is set
@@ -42,13 +50,16 @@
 #   ~/.bash_profile, ~/.bash_login or     startup block between >>>
 #     ~/.profile (first existing file)    and <<< markers
 #   ~/.fbtermrc                           only if it does not exist
-#   ~/.local/share/fbterm-background/     original and 16:9 wallpapers
+#   ~/.local/share/fbterm-background/     original wallpaper
+#   ~/.local/share/fonts/fbterm-background/ Default8x16 bitmap font
+#   ~/.config/fontconfig/conf.d/          accept the bitmap font
 #   ~/.config/fbterm-background/          config and disable switch
 #
-# APT packages (with --no-install-recommends): fbterm, fastfetch and a
-# monospace font. No X11: fbterm only needs fontconfig/freetype (font
-# libraries, not X). Note: "libx86-1" is NOT X11, it is an x86
-# real-mode library used by fbterm's VESA mode.
+# APT packages (with --no-install-recommends): fbterm and fastfetch.
+# No font package is installed: the 8x16 bitmap font is bundled.
+# No X11: fbterm only needs fontconfig/freetype (font libraries, not
+# X). Note: "libx86-1" is NOT X11, it is an x86 real-mode library
+# used by fbterm's VESA mode.
 #
 # Emergency exits:
 #   - Inside FbTerm: Ctrl+Alt+E.
@@ -60,15 +71,22 @@
 set -Eeuo pipefail
 
 # --- Editable settings --------------------------------------------------------
+FONT_NAME="Default8x16"   # bundled classic 8x16 bitmap font
 FONT_SIZE=16              # FbTerm font size (~/.fbtermrc)
-BACKGROUND_MODE="cover"   # cover = wallpaper-16x9.png (full screen)
+FONT_WIDTH=8              # forced classic console cell width
+FONT_HEIGHT=16            # forced classic console cell height
+BACKGROUND_MODE="cover"   # cover = fill the real display, cropping
                           # fit   = original image, complete and centered
+BACKGROUND_BRIGHTNESS=45   # percent: 100 = original, lower = darker
 # ------------------------------------------------------------------------------
 
 DEST_BIN="$HOME/.local/bin/fbterm-background"
 DEST_IDUMP="$HOME/.local/bin/idump"
 DEST_DATA="$HOME/.local/share/fbterm-background"
 DEST_CONFIG_DIR="$HOME/.config/fbterm-background"
+DEST_FONT_DIR="$HOME/.local/share/fonts/fbterm-background"
+DEST_FONTCONFIG_DIR="$HOME/.config/fontconfig/conf.d"
+DEST_FONTCONFIG_FILE="$DEST_FONTCONFIG_DIR/70-fbterm-background-bitmap.conf"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 MARK_BEGIN='# >>> fbterm-background (TTY) >>>'
@@ -168,8 +186,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
         clean_profile_file "$f" >/dev/null || true
     done
     # Current files.
-    rm -f "$DEST_BIN" "$DEST_IDUMP"
-    rm -rf "$HOME/.cache/fbterm-background" "$DEST_CONFIG_DIR" "$DEST_DATA"
+    rm -f "$DEST_BIN" "$DEST_IDUMP" "$DEST_FONTCONFIG_FILE"
+    rm -rf "$HOME/.cache/fbterm-background" "$DEST_CONFIG_DIR" "$DEST_DATA" \
+           "$DEST_FONT_DIR"
     # Legacy files from the previous (Spanish) version.
     rm -f "$HOME/.local/bin/fbterm-fondo"
     rm -rf "$HOME/.cache/fbterm-fondo" "$HOME/.config/fbterm-fondo" \
@@ -193,15 +212,13 @@ fi
     echo "Error: the idump binary is missing next to this script." >&2
     echo "If your architecture is not x86_64, build it first: ./compile-idump.sh" >&2
     exit 1; }
+[ -f "$SCRIPT_DIR/Default8x16.bdf" ] || {
+    echo "Error: Default8x16.bdf is missing next to this script." >&2; exit 1; }
 
 # --- Required packages (Debian trixie, no recommends) --------------------------
 PACKAGES=()
 command -v fbterm    >/dev/null 2>&1 || PACKAGES+=(fbterm)
 command -v fastfetch >/dev/null 2>&1 || PACKAGES+=(fastfetch)
-if ! dpkg-query -W fonts-dejavu-core >/dev/null 2>&1 \
-   && ! dpkg-query -W fonts-dejavu-mono >/dev/null 2>&1; then
-    PACKAGES+=(fonts-dejavu-core)
-fi
 
 if [ "${#PACKAGES[@]}" -gt 0 ] && [ "$USE_APT" -eq 1 ]; then
     if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
@@ -231,10 +248,30 @@ if [ -e /dev/fb0 ] && ! id -nG | grep -qw video; then
 fi
 
 # --- Copy wallpaper, viewer and source ----------------------------------------
-mkdir -p "$DEST_DATA" "$DEST_CONFIG_DIR" "$HOME/.local/bin"
+mkdir -p "$DEST_DATA" "$DEST_CONFIG_DIR" "$HOME/.local/bin" \
+         "$DEST_FONT_DIR" "$DEST_FONTCONFIG_DIR"
 install -m 0644 "$SCRIPT_DIR/wallpaper.png" "$DEST_DATA/wallpaper.png"
-if [ -f "$SCRIPT_DIR/wallpaper-16x9.png" ]; then
-    install -m 0644 "$SCRIPT_DIR/wallpaper-16x9.png" "$DEST_DATA/wallpaper-16x9.png"
+# The old pre-cropped 16:9 file is no longer used: idump now fits the
+# original image to the actual framebuffer at login.
+rm -f "$DEST_DATA/wallpaper-16x9.png"
+install -m 0644 "$SCRIPT_DIR/Default8x16.bdf" "$DEST_FONT_DIR/Default8x16.bdf"
+cat > "$DEST_FONTCONFIG_FILE" <<'EOF_FONTCONFIG'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<!-- fbterm-background: Debian fontconfig rejects bitmap fonts by
+     default. Accept only the bundled classic 8x16 console font. -->
+<fontconfig>
+  <selectfont>
+    <acceptfont>
+      <pattern>
+        <patelt name="family"><string>Default8x16</string></patelt>
+      </pattern>
+    </acceptfont>
+  </selectfont>
+</fontconfig>
+EOF_FONTCONFIG
+if command -v fc-cache >/dev/null 2>&1; then
+    fc-cache -f "$DEST_FONT_DIR" >/dev/null 2>&1 || true
 fi
 install -m 0755 "$SCRIPT_DIR/idump" "$DEST_IDUMP"
 # Transparency: the viewer's source code is installed too.
@@ -258,8 +295,10 @@ fi
 if [ ! -f "$DEST_CONFIG_DIR/config" ]; then
     cat > "$DEST_CONFIG_DIR/config" <<EOF_CFG
 # Persistent background settings.
-# cover = 16:9 version, full screen; fit = original image, centered.
+# cover = fill the display, cropping; fit = whole image, centered.
+# FBTERM_BRIGHTNESS is a percentage: 100 is the original image.
 FBTERM_MODE=$BACKGROUND_MODE
+FBTERM_BRIGHTNESS=$BACKGROUND_BRIGHTNESS
 EOF_CFG
     echo "Created $DEST_CONFIG_DIR/config (FBTERM_MODE=$BACKGROUND_MODE)"
 else
@@ -295,6 +334,7 @@ fi
 # KEY=VALUE data, never shell code. Only FBTERM_MODE is honoured, and
 # only the values "cover" and "fit" are accepted.
 MODE="cover"
+BRIGHTNESS=45
 CONFIG_FILE="$HOME/.config/fbterm-background/config"
 if [ -f "$CONFIG_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -306,6 +346,10 @@ if [ -f "$CONFIG_FILE" ]; then
                 MODE="${line#FBTERM_MODE=}" ;;
             FBTERM_MODE=*)
                 echo "fbterm-background: ignoring invalid FBTERM_MODE in $CONFIG_FILE" >&2 ;;
+            FBTERM_BRIGHTNESS=[0-9]|FBTERM_BRIGHTNESS=[0-9][0-9]|FBTERM_BRIGHTNESS=100)
+                BRIGHTNESS="${line#FBTERM_BRIGHTNESS=}" ;;
+            FBTERM_BRIGHTNESS=*)
+                echo "fbterm-background: ignoring invalid FBTERM_BRIGHTNESS in $CONFIG_FILE" >&2 ;;
         esac
     done < "$CONFIG_FILE"
 fi
@@ -315,12 +359,17 @@ case "${FBTERM_MODE:-}" in
     "") ;;
     *) echo "fbterm-background: ignoring invalid FBTERM_MODE in environment" >&2 ;;
 esac
+case "${FBTERM_BRIGHTNESS:-}" in
+    [0-9]|[0-9][0-9]|100) BRIGHTNESS="$FBTERM_BRIGHTNESS" ;;
+    "") ;;
+    *) echo "fbterm-background: ignoring invalid FBTERM_BRIGHTNESS in environment" >&2 ;;
+esac
 
+IMG="$DATA/wallpaper.png"
 if [ "$MODE" = "fit" ]; then
-    IMG="$DATA/wallpaper.png"
+    IDUMP_ARGS=(-f -d "$BRIGHTNESS")
 else
-    IMG="$DATA/wallpaper-16x9.png"
-    [ -f "$IMG" ] || IMG="$DATA/wallpaper.png"
+    IDUMP_ARGS=(-c -d "$BRIGHTNESS")
 fi
 
 fail() { echo "fbterm-background: $*" >&2; exit 1; }
@@ -385,9 +434,9 @@ fi
 export FRAMEBUFFER="$FBDEV"
 printf '\033[?25l'
 if command -v timeout >/dev/null 2>&1; then
-    timeout 10 "$IDUMP_BIN" -f "$IMG" >/dev/null 2>&1
+    timeout 10 "$IDUMP_BIN" "${IDUMP_ARGS[@]}" "$IMG" >/dev/null 2>&1
 else
-    "$IDUMP_BIN" -f "$IMG" >/dev/null 2>&1
+    "$IDUMP_BIN" "${IDUMP_ARGS[@]}" "$IMG" >/dev/null 2>&1
 fi
 IDUMP_STATUS=$?
 printf '\033[?25h'
@@ -401,21 +450,28 @@ EOF_LAUNCHER
 chmod 0755 "$DEST_BIN"
 echo "Launcher created: $DEST_BIN"
 
-# --- FbTerm configuration (only if it does not exist) ---------------------------
-if [ ! -f "$HOME/.fbtermrc" ]; then
+# --- FbTerm configuration -------------------------------------------------------
+# A file created by this installer is refreshed on reinstall (this is
+# how the classic 8x16 font replaces the old vector "mono" setting).
+# A file you created yourself is never overwritten.
+if [ ! -f "$HOME/.fbtermrc" ] \
+   || grep -qF '# Created by fbterm-background installer' "$HOME/.fbtermrc"; then
     cat > "$HOME/.fbtermrc" <<EOF_FBRC
 # Created by fbterm-background installer
 # FbTerm configuration (see "man fbterm", options section).
-font-names=mono
+font-names=$FONT_NAME
 font-size=$FONT_SIZE
+font-width=$FONT_WIDTH
+font-height=$FONT_HEIGHT
 color-foreground=7
 color-background=0
 history-lines=5000
 text-encodings=
 EOF_FBRC
-    echo "Created $HOME/.fbtermrc (monospace font, ${FONT_SIZE}px)"
+    echo "Configured $HOME/.fbtermrc (classic 8x16 bitmap font)"
 else
-    echo "$HOME/.fbtermrc already exists: not modified."
+    echo "$HOME/.fbtermrc already exists and was not created by this installer: not modified."
+    echo "For the classic console font, set: font-names=$FONT_NAME, font-size=$FONT_SIZE, font-width=$FONT_WIDTH, font-height=$FONT_HEIGHT"
 fi
 
 # --- Startup block in the login profile -----------------------------------------
@@ -528,9 +584,12 @@ Done. How to try it:
   3) To exit FbTerm: Ctrl+Alt+E (this also ends the login session).
 
 Notes:
-  - Image mode lives in ~/.config/fbterm-background/config:
-    FBTERM_MODE=cover (16:9, full screen) or =fit (original image,
-    complete and centered). The file is preserved on reinstall.
+  - Image settings live in ~/.config/fbterm-background/config:
+    FBTERM_MODE=cover (fill display) or =fit (whole image, centered),
+    and FBTERM_BRIGHTNESS=45 (percent; lower is darker). The file is
+    preserved on reinstall.
+  - Font: classic Default8x16 bitmap (8x16, 256 glyphs), forced to
+    an 8x16 cell in ~/.fbtermrc.
   - No fbi or ImageMagick at runtime: the only viewer is
     ~/.local/bin/idump (static, no dependencies). Its source ships
     in this folder.
