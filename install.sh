@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.2"
 SCRIPT_NAME="$(basename "$0")"
 
 DRY_RUN=0
@@ -2084,6 +2084,8 @@ self_check() {
         '/etc/kernel/postrm.d/zz-limine-update'
         '/etc/initramfs/post-update.d/zz-limine-update'
         'GUI=no confirmado: sin Xorg'
+        'conv=fsync status=none'
+        'El anfitrión está rechazando escrituras dentro de'
         'GUI=no: no se crea /etc/X11 en el sistema instalado'
         'xserver-xorg-core xserver-xorg-input-all xserver-xorg-video-all xauth xinit x11-xkb-utils x11-xserver-utils libgl1-mesa-dri mesa-utils'
         'ui_banner'
@@ -2453,7 +2455,19 @@ luks_pass_file() {
 
 stage_3_luks_mount() {
     log "=== Etapa 3: LUKS y montaje ==="
-    run mkfs.fat -F32 -n "$BOOT_LABEL" "$B"
+    # Sonda de escritura CON FLUSH sobre la ESP antes de formatear. Si
+    # el anfitrión/QEMU rechaza las escrituras dentro de /dev/sda2
+    # (p. ej. el anfitrion con el volumen FAT32 viejo montado: critical
+    # target error ya en el sector 18432), esto lo detecta al momento
+    # y con un mensaje explicable, en vez de dejar que mkfs.fat muera
+    # entre líneas de kernel. Escribir ceros aquí es seguro: la ESP
+    # se formatea justo después.
+    if ! run dd if=/dev/zero of="$B" bs=1M count=1 conv=fsync status=none; then
+        die "El anfitrión está rechazando escrituras dentro de $B (sonda con flush). Causa probable: el anfitrion tiene montado el volumen FAT32 viejo. Una unidad USB extraible NO admite 'offline' en el anfitrion: apaga la VM, quita la letra de unidad de TODAS las particiones de ese disco, cierra el Explorador y empieza de cero. Si aun así falla, no reinicies: ejecuta 'dmesg | grep -i sense | tail' en el live y guarda la Sense Key (Data Protect = protección/montado; Medium Error = memoria USB muriendo)"
+    fi
+    if ! run mkfs.fat -F32 -n "$BOOT_LABEL" "$B"; then
+        die "mkfs.fat no pudo escribir en $B: el anfitrión/QEMU está rechazando escrituras (critical target error). Revisa que ninguna particion de ese disco tenga letra de unidad en el anfitrion y lee la Sense Key con 'dmesg | grep -i sense | tail' antes de reiniciar"
+    fi
     local pf="$SCRATCH_DIR_REAL/luks.pass"
     if (( ! DRY_RUN && ! SIMULATE )); then luks_pass_file "$pf"; fi
     if [[ "$PBKDF" == argon2id ]]; then
