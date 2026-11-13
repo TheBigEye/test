@@ -1,12 +1,12 @@
 [Plymouth Theme]
-Name=linux-mac-style
+Name=tux-boot
 Description=Generic Linux Tux Logo boot animation, inspired by the Boot animation of macOS.
 ModuleName=two-step
 
 [two-step]
 Font=Cantarell 12
 TitleFont=Cantarell Light 30
-ImageDir=/usr/share/plymouth/themes/linux-mac-style/images
+ImageDir=/usr/share/plymouth/themes/tux-boot
 DialogHorizontalAlignment=.5
 DialogVerticalAlignment=.5
 TitleHorizontalAlignment=.5
