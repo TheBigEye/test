@@ -1,0 +1,216 @@
+fbterm-compat.patch -- xterm sequence compatibility for FbTerm 1.7
+==================================================================
+
+Stock FbTerm 1.7 (as packaged by Debian, fbterm 1.7-5) predates
+several xterm escape sequences that modern programs emit
+unconditionally, without consulting terminfo (fastfetch is one):
+
+  * SGR 90-97 / 100-107      bright foreground/background colours
+  * SGR 38;5;<n> / 48;5;<n>  256-colour foreground/background
+  * SGR 38;2 / 48;2          truecolor (approximated to the cube)
+  * OSC sequences            (OSC 8 hyperlinks, OSC 52, titles...)
+
+Without this patch, SGR 48;5;<n> turns blink on, and an OSC 8
+hyperlink ("ESC ] 8 ;; file://... BEL") leaks onto the screen as
+garbage text, because FbTerm's parser had no OSC state at all.
+
+The patch teaches FbTerm's VT parser:
+  * src/lib/vterm_action.cpp: the SGR codes above, in
+    set_display_attr(); FbTerm's CharAttr already stores 8-bit
+    colour indices and its renderer already has a 256-colour
+    palette (used by its private ESC[1;<n>} sequences), so this
+    is purely a parser addition. Legacy SGR 38 behaviour
+    (default colour + underline) is kept for the non-extended form.
+  * src/lib/vterm_states.cpp + src/lib/vterm.cpp + vterm.h: a real
+    OSC state (ESosc). An OSC is consumed until BEL, CAN, SUB or
+    ST (ESC \) and dropped, except FbTerm's own palette commands
+    (ESC ] P... / ESC ] R), which are handed to the legacy
+    ESnonstd state unchanged. ESC \ is also accepted as a string
+    terminator in the ESesc state.
+
+Apply AFTER the Debian patch series (build-fbterm-patched.sh does
+the full download/patch/build/install cycle):
+
+    patch -p1 < fbterm-compat.patch
+
+Result: /usr/local/bin/fbterm-patched (stock /usr/bin/fbterm is
+not touched).
+
+--- a/src/lib/vterm.h
++++ b/src/lib/vterm.h
+@@ -167,6 +167,7 @@
+ 	u32 translate_char(u32);
+ 	void set_cursor_type();
+ 	void linux_specific();
++	void begin_osc();
+ 	void begin_set_palette();
+ 	void set_palette();
+ 	void reset_palette();
+@@ -185,7 +186,7 @@
+ 	static bool init_ambiguous_wide();
+ 
+ 	typedef enum {
+-		ESnormal = 0, ESesc, ESsquare, ESnonstd, ESpercent, EScharset, EShash, ESfunckey, ESkeep
++		ESnormal = 0, ESesc, ESsquare, ESnonstd, ESpercent, EScharset, EShash, ESfunckey, ESosc, ESkeep
+ 	} EscapeState;
+ 
+ 	EscapeState esc_state;
+@@ -266,6 +267,7 @@
+ 	#define NPAR 16
+ 	u16 npar, param[NPAR];
+ 	bool q_mode, palette_mode;
++	bool osc_first; // true until the first char of an OSC sequence is seen
+ 
+ 	//history
+ 	static u16 history_lines;
+--- a/src/lib/vterm_states.cpp
++++ b/src/lib/vterm_states.cpp
+@@ -50,7 +50,8 @@
+ 
+ 	// ESesc
+ 	{ '[', &VTerm::clear_param,	ESsquare },
+-	{ ']', &VTerm::clear_param,	ESnonstd },
++	{ ']', &VTerm::begin_osc,	ESosc },
++	{ '\\', 0,	ESnormal }, // ST (ESC \) terminates string sequences
+ 	{ '%', 0,	ESpercent },
+ 	{ '#', 0,	EShash },
+ 	{ '(', &VTerm::current_is_g0,	EScharset },
+@@ -133,4 +134,7 @@
+ 
+ 	// ESfunckey
+ 	{ 0xFFFF },
++
++	// ESosc
++	{ 0xFFFF },
+ };
+--- a/src/lib/vterm.cpp
++++ b/src/lib/vterm.cpp
+@@ -469,6 +469,31 @@
+ 
+ void VTerm::do_control_char()
+ {
++	/* Inside an OSC sequence (ESC ] ...), swallow every character
++	 * until a terminator arrives: BEL, CAN, SUB, or ST (ESC \).
++	 * The palette commands (ESC ] P... / ESC ] R) are the only OSC
++	 * sequences FbTerm implements; they are handed over to the
++	 * legacy ESnonstd state. Everything else (OSC 8 hyperlinks,
++	 * OSC 52 clipboard data, window titles, ...) is silently
++	 * dropped, as other terminals do with unknown OSC sequences. */
++	if (esc_state == ESosc) {
++		if (cur_char == 0x07 || cur_char == 0x18 || cur_char == 0x1A) {
++			esc_state = ESnormal;
++			return;
++		}
++		if (cur_char != 0x1B) {
++			if (osc_first) {
++				osc_first = false;
++				if (cur_char == 'P' || cur_char == 'R')
++					esc_state = ESnonstd;
++				else
++					return;
++			} else {
++				return;
++			}
++		}
++	}
++
+ 	u8 index = (cur_char < MAX_CONTROL_CODE ? control_map[cur_char] : 0);
+ 	const Sequence *seq = control_sequences + index;
+ 
+--- a/src/lib/vterm_action.cpp
++++ b/src/lib/vterm_action.cpp
+@@ -96,6 +96,12 @@
+ 	memset(param, 0, sizeof(param));
+ }
+ 
++void VTerm::begin_osc()
++{
++	clear_param();
++	osc_first = true;
++}
++
+ void VTerm::save_cursor()
+ {
+ 	s_g0_charset = g0_charset;
+@@ -460,6 +466,25 @@
+ 	enable_mode(false);
+ }
+ 
++/* Map a 24-bit RGB colour onto the xterm 256-colour palette
++ * (6x6x6 colour cube; grey ramp for greys). FbTerm has no truecolor
++ * framebuffer mode, so SGR 38;2/48;2 colours are approximated. */
++static u8 rgb_to_256(u16 r, u16 g, u16 b)
++{
++	if (r > 255) r = 255;
++	if (g > 255) g = 255;
++	if (b > 255) b = 255;
++
++	if (r == g && g == b) {
++		if (r < 8) return 16;
++		if (r > 248) return 231;
++		return 232 + (r - 8) * 24 / 247;
++	}
++
++	return 16 + 36 * ((r * 5 + 127) / 255)
++		+ 6 * ((g * 5 + 127) / 255) + ((b * 5 + 127) / 255);
++}
++
+ void VTerm::set_display_attr()
+ {
+ 	for (u16 n = 0; n <= npar; n++) {
+@@ -520,8 +545,21 @@
+ 			char_attr.fcolor = param[n] % 10;
+ 			break;
+ 		case 38:
+-			char_attr.fcolor = cur_fcolor;
+-			char_attr.underline = true;
++			if (n + 2 <= npar && param[n + 1] == 5) {
++				// SGR 38;5;<n>: 256-colour foreground
++				char_attr.fcolor = param[n + 2];
++				n += 2;
++			} else if (n + 4 <= npar && param[n + 1] == 2) {
++				// SGR 38;2;<r>;<g>;<b>: truecolor (approximated)
++				char_attr.fcolor = rgb_to_256(param[n + 2], param[n + 3], param[n + 4]);
++				n += 4;
++			} else if (n < npar && (param[n + 1] == 5 || param[n + 1] == 2)) {
++				// truncated extended colour sequence: ignore it
++				n = npar;
++			} else {
++				char_attr.fcolor = cur_fcolor;
++				char_attr.underline = true;
++			}
+ 			break;
+ 		case 39:
+ 			char_attr.fcolor = cur_fcolor;
+@@ -530,9 +568,31 @@
+ 		case 40 ... 47:
+ 			char_attr.bcolor = param[n] % 10;
+ 			break;
++		case 48:
++			if (n + 2 <= npar && param[n + 1] == 5) {
++				// SGR 48;5;<n>: 256-colour background
++				char_attr.bcolor = param[n + 2];
++				n += 2;
++			} else if (n + 4 <= npar && param[n + 1] == 2) {
++				// SGR 48;2;<r>;<g>;<b>: truecolor (approximated)
++				char_attr.bcolor = rgb_to_256(param[n + 2], param[n + 3], param[n + 4]);
++				n += 4;
++			} else if (n < npar && (param[n + 1] == 5 || param[n + 1] == 2)) {
++				// truncated extended colour sequence: ignore it
++				n = npar;
++			}
++			break;
+ 		case 49:
+ 			char_attr.bcolor = cur_bcolor;
+ 			break;
++		case 90 ... 97:
++			// bright foreground colours
++			char_attr.fcolor = param[n] - 90 + 8;
++			break;
++		case 100 ... 107:
++			// bright background colours
++			char_attr.bcolor = param[n] - 100 + 8;
++			break;
+ 		default :
+ 			break;
+ 		}

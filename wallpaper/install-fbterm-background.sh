@@ -391,7 +391,16 @@ case "$TTY_ACTUAL" in
     *) fail "not a physical TTY ($TTY_ACTUAL). Log in on tty1-tty6 and retry." ;;
 esac
 
-command -v fbterm >/dev/null 2>&1 || fail "fbterm is missing: sudo apt-get install --no-install-recommends fbterm"
+# A patched FbTerm (./build-fbterm-patched.sh: native bright/256
+# colors and OSC handling) wins over the stock binary when present.
+# The choice is made on every login, so installing or removing the
+# patched binary takes effect without reinstalling anything.
+FBTERM_BIN=fbterm
+if [ -x /usr/local/bin/fbterm-patched ]; then
+    FBTERM_BIN=/usr/local/bin/fbterm-patched
+fi
+
+command -v "$FBTERM_BIN" >/dev/null 2>&1 || fail "fbterm is missing: sudo apt-get install --no-install-recommends fbterm"
 
 open_fbterm() {
     export FBTERM_BACKGROUND_ACTIVE=1
@@ -411,7 +420,12 @@ open_fbterm() {
     # redirecting the fbterm process's own stdout is harmless.
     LOG_DIR="$HOME/.cache/fbterm-background"
     mkdir -p "$LOG_DIR"
-    fbterm -- /bin/bash -l >"$LOG_DIR/fbterm.log" 2>&1
+    if [ "$FBTERM_BIN" != fbterm ]; then
+        # Tells the login block inside the session that fastfetch
+        # needs no output filter: colors and OSC are native there.
+        export FBTERM_PATCHED=1
+    fi
+    "$FBTERM_BIN" -- /bin/bash -l >"$LOG_DIR/fbterm.log" 2>&1
     FBTERM_STATUS=$?
     # Re-show the kernel-console cursor (hidden while painting; see
     # below). FbTerm draws its own cursor while it runs.
@@ -584,24 +598,59 @@ if [ -z "${FBTERM_BACKGROUND_ACTIVE:-}" ]; then
     fi
 elif [ -z "${FBTERM_FASTFETCH_DONE:-}" ]; then
     export FBTERM_FASTFETCH_DONE=1
-    [ "${TERM:-}" = "linux" ] && export TERM=fbterm
+    # Prefer the 256-color terminfo name when it has been compiled
+    # (./compile-fbterm-256color.sh); stock "fbterm" otherwise. Both
+    # describe the same entry: FbTerm renders 256 colors through its
+    # private sequences (ESC [ 1;n } / ESC [ 2;n }), which the
+    # terminfo setaf/setab already use.
+    if [ "${TERM:-}" = "linux" ]; then
+        if infocmp fbterm-256color >/dev/null 2>&1; then
+            export TERM=fbterm-256color
+        else
+            export TERM=fbterm
+        fi
+    fi
     if command -v fastfetch >/dev/null 2>&1; then
-        # On a TTY, fastfetch wraps the Disk mountpoint in an OSC 8
-        # hyperlink (ESC ] 8 ;; file://...). FbTerm's escape parser
-        # predates OSC 8 and prints it as garbage ("Disk
-        # (://///;:;)"), so strip OSC sequences from its output.
-        # The filter also translates bright SGR colors (90-97 text,
-        # 100-107 background), which FbTerm ignores, into its
-        # classic model: bold+30-37 = bright text, blink+40-47 =
-        # bright background. Without this, fastfetch's second
-        # Colors row (bright backgrounds) renders as uniform gray.
-        # "--pipe false" keeps colors even though stdout is a pipe.
-        if command -v perl >/dev/null 2>&1; then
+        if [ -n "${FBTERM_PATCHED:-}" ]; then
+            # Patched FbTerm (./build-fbterm-patched.sh) understands
+            # OSC 8 hyperlinks and bright/256-color SGR natively, so
+            # fastfetch runs unfiltered, exactly like on xterm. This
+            # covers the automatic run and later manual runs alike.
             if command -v timeout >/dev/null 2>&1; then
-                timeout 15 fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g; s/\x1b\[([0-9;]*)m/ my $p=$1; my @a=split(q{;},$p,-1); my $pre=""; @a=map { if ($_ >= 100 && $_ <= 107) { $pre="5;"; $_ - 60 } elsif ($_ >= 90 && $_ <= 97) { $pre="1;"; $_ - 60 } else { $_ } } @a; "\x1b[" . $pre . join(";", @a) . "m" /ge' || true
+                timeout 15 fastfetch || true
             else
-                fastfetch --pipe false | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g; s/\x1b\[([0-9;]*)m/ my $p=$1; my @a=split(q{;},$p,-1); my $pre=""; @a=map { if ($_ >= 100 && $_ <= 107) { $pre="5;"; $_ - 60 } elsif ($_ >= 90 && $_ <= 97) { $pre="1;"; $_ - 60 } else { $_ } } @a; "\x1b[" . $pre . join(";", @a) . "m" /ge' || true
+                fastfetch || true
             fi
+        elif command -v perl >/dev/null 2>&1; then
+            # Stock FbTerm: fastfetch needs a filter, for the
+            # automatic run below AND for any later manual run in
+            # this session:
+            #  - On a TTY it wraps the Disk mountpoint in an OSC 8
+            #    hyperlink (ESC ] 8 ;; file://...). FbTerm's escape
+            #    parser predates OSC 8 and prints it as garbage
+            #    ("Disk (://///;:;)"), so OSC sequences are stripped.
+            #  - It also emits bright SGR colors (90-97 text,
+            #    100-107 background), which FbTerm ignores. The
+            #    filter translates them into FbTerm's classic model:
+            #    bold+30-37 = bright text, blink+40-47 = bright
+            #    background. Without this, fastfetch's second Colors
+            #    row renders as uniform gray.
+            # "--pipe false" keeps colors even though stdout is a
+            # pipe. The real binary stays reachable as
+            # "command fastfetch".
+            # shellcheck disable=SC2120,SC2119
+            fastfetch() {
+                local _ffbin
+                _ffbin="$(type -P fastfetch)"
+                [ -n "$_ffbin" ] || return 127
+                if command -v timeout >/dev/null 2>&1; then
+                    timeout 15 "$_ffbin" --pipe false "$@" | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g; s/\x1b\[([0-9;]*)m/ my $p=$1; my @a=split(q{;},$p,-1); my $pre=""; @a=map { if ($_ >= 100 && $_ <= 107) { $pre="5;"; $_ - 60 } elsif ($_ >= 90 && $_ <= 97) { $pre="1;"; $_ - 60 } else { $_ } } @a; "\x1b[" . $pre . join(";", @a) . "m" /ge'
+                    return "${PIPESTATUS[0]}"
+                fi
+                "$_ffbin" --pipe false "$@" | perl -pe 's/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)//g; s/\x1b\[([0-9;]*)m/ my $p=$1; my @a=split(q{;},$p,-1); my $pre=""; @a=map { if ($_ >= 100 && $_ <= 107) { $pre="5;"; $_ - 60 } elsif ($_ >= 90 && $_ <= 97) { $pre="1;"; $_ - 60 } else { $_ } } @a; "\x1b[" . $pre . join(";", @a) . "m" /ge'
+                return "${PIPESTATUS[0]}"
+            }
+            fastfetch || true
         elif command -v timeout >/dev/null 2>&1; then
             timeout 15 fastfetch || true
         else
@@ -629,6 +678,16 @@ Notes:
     preserved on reinstall.
   - Font: classic Default8x16 bitmap (8x16, 256 glyphs), forced to
     an 8x16 cell in ~/.fbtermrc.
+  - 256 colors: run ./compile-fbterm-256color.sh once; afterwards
+    TERM inside FbTerm is fbterm-256color (terminfo entry compiled
+    into ~/.terminfo; the stock fbterm binary already supports it).
+  - Native xterm sequences (optional): run
+    ./build-fbterm-patched.sh once to compile a patched FbTerm
+    into /usr/local/bin/fbterm-patched (stock binary untouched).
+    The launcher then uses it automatically and fastfetch runs
+    unfiltered - no Perl translation - because bright colors,
+    38;5;n colors and OSC sequences are handled natively.
+    Undo with ./build-fbterm-patched.sh --uninstall.
   - No fbi or ImageMagick at runtime: the only viewer is
     ~/.local/bin/idump (static, no dependencies). Its source ships
     in this folder.
